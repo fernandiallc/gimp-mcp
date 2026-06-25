@@ -26,7 +26,19 @@ py-modules = ["gimp_mcp_server"]
 [tool.ruff.lint.per-file-ignores]
 "gimp-mcp-plugin.py" = ["E402"]
 
+[tool.pytest.ini_options]
+# Repo root holds gimp_mcp_server.py as a top-level module; put it on sys.path
+# so unit tests under tests/ can `import gimp_mcp_server`.
+pythonpath = ["."]
+testpaths = ["tests"]
+# Only collect test_*.py. The default also matches *_test.py, which would pull in
+# tests/continuous_edit_test/continuous_edit_test.py — a standalone argparse script
+# that calls sys.exit() at import and crashes collection.
+python_files = ["test_*.py"]
+
 [dependency-groups]
 dev = [
     "pre-commit>=4.5.1",
+    "pytest>=8",
+    "ruff>=0.6",
 ]

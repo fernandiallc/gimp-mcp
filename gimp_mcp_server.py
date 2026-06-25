@@ -210,7 +210,7 @@ def new_canvas(
 
 
 @mcp.tool()
-def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int | None = None, region: dict | None = None) -> Image:
+def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int | None = None, region: dict | None = None, format: str = "png", quality: int = 85) -> Image:
     """Get the current open image in GIMP as an Image object with optional scaling and region selection.
 
     No size restrictions — pass any max_width/max_height you need.
@@ -227,6 +227,9 @@ def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int
         - origin_x, origin_y: Top-left corner of region to extract
         - width, height: Dimensions of region to extract
         - max_width, max_height: Optional scaling for the extracted region
+    - format: Output encoding, "png" (default, lossless, preserves alpha) or "jpeg"
+      (lossy, smaller payload, no alpha/transparency — use for photo previews to save tokens).
+    - quality: JPEG quality 1-100 (default 85). Ignored when format="png".
 
     Examples:
     - Full image at full res: get_image_bitmap()
@@ -257,17 +260,24 @@ def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int
             params["max_height"] = max_height
         if region is not None:
             params["region"] = region
-            
+        # Forward format/quality only when non-default so existing PNG calls
+        # produce byte-identical wire params (back-compat).
+        if format and format != "png":
+            params["format"] = format
+            params["quality"] = quality
+
         result = conn.send_command("get_image_bitmap", params)
         if result["status"] == "success":
-            # Extract the base64 image data 
+            # Extract the base64 image data
             image_info = result["results"]
             base64_data = image_info["image_data"]
 
             as_bytes = base64.b64decode(base64_data)
 
-            # Return as MCP Image object (base64 data will be handled automatically)
-            return Image(data=as_bytes, format="png")
+            # Return as MCP Image object (base64 data will be handled automatically).
+            # Honor the format the plugin actually exported; default to png for
+            # back-compat with older plugins that don't echo a format.
+            return Image(data=as_bytes, format=image_info.get("format", "png"))
         else:
             raise Exception(f"GIMP error: {result.get('error', 'Unknown error')}")
     except Exception as e:
@@ -345,7 +355,9 @@ def get_state_snapshot(
     image_index: int = 0,
     max_size: int = 512,
     region: dict | None = None,
-    label: str = ""
+    label: str = "",
+    format: str = "png",
+    quality: int = 85
 ) -> Image:
     """Return a live visual snapshot of the current image state — no file save needed.
 
@@ -358,6 +370,10 @@ def get_state_snapshot(
     - region: Optional dict {x, y, width, height} to zoom into a specific area
               e.g. {"x": 200, "y": 300, "width": 100, "height": 80} for mouth area
     - label: Optional annotation label (logged but not drawn — for agent bookkeeping)
+    - format: Output encoding, "png" (default) or "jpeg". JPEG is ~8-10x smaller —
+      prefer it for photo previews to save tokens; PNG keeps alpha and is best for
+      line-art/text. Transparency is lost when format="jpeg".
+    - quality: JPEG quality 1-100 (default 85). Ignored when format="png".
 
     Returns:
     - PNG image of the current GIMP canvas state (with alpha if present)
@@ -385,12 +401,16 @@ def get_state_snapshot(
                 "width":    int(region.get("width",  max_size)),
                 "height":   int(region.get("height", max_size)),
             }
+        # Forward format/quality only when non-default (back-compat wire params).
+        if format and format != "png":
+            params["format"] = format
+            params["quality"] = quality
         result = conn.send_command("get_image_bitmap", params)
         if result["status"] == "success":
             img_info  = result["results"]
             b64_data  = img_info["image_data"]
             raw_bytes = base64.b64decode(b64_data)
-            return Image(data=raw_bytes, format="png")
+            return Image(data=raw_bytes, format=img_info.get("format", "png"))
         raise Exception(result.get("error", "Unknown error"))
     except Exception as e:
         traceback.print_exc()
@@ -435,7 +455,7 @@ def get_context_state(ctx: Context) -> dict:
 
 
 @mcp.tool()
-def call_api(ctx: Context, api_path: str, args: list = [], kwargs: dict = {}) -> str:
+def call_api(ctx: Context, api_path: str, args: list | None = None, kwargs: dict | None = None) -> str:
     """Call GIMP 3.2 API methods through PyGObject console.
 
     GIMP MCP Protocol:
@@ -505,17 +525,25 @@ def call_api(ctx: Context, api_path: str, args: list = [], kwargs: dict = {}) ->
     - kwargs: Dictionary of keyword arguments (rarely used)
 
     Returns:
-    - JSON string of the result or error message
+    - JSON string (json.dumps) of result["results"] on success.
+
+    Raises:
+    - RuntimeError if GIMP returns a {"status":"error"} envelope; the message
+      includes result["error"] and result["traceback"] when present.
     """
+    args = args if args is not None else []
+    kwargs = kwargs if kwargs is not None else {}
     try:
         conn = get_gimp_connection()
         result = conn.send_command("call_api", {"api_path": api_path, "args": args, "kwargs": kwargs})
-        if result["status"] == "success":
-            return json.dumps(result["results"])
-        else:
-            return f"Error: {json.dumps(result['error'])}"
+        if result["status"] != "success":
+            error = result.get("error", "Unknown error")
+            tb = result.get("traceback", "")
+            raise RuntimeError(f"GIMP error: {error}\n{tb}".rstrip())
+        return json.dumps(result["results"])
     except Exception as e:
-        return f"Error: {e}"
+        traceback.print_exc()
+        raise Exception(f"call_api failed: {e}")
 
 @mcp.prompt(
     description="GIMP MCP best practices for common operations - filling shapes, bezier paths, and variable persistence"
@@ -1654,6 +1682,85 @@ def reorder_layer(
 
 
 @mcp.tool()
+def add_layer_mask(
+    ctx: Context,
+    image_index: int = 0,
+    layer_name: str | None = None,
+    mask_type: str = "white",
+) -> dict:
+    """Add a layer mask to a layer for non-destructive masking.
+
+    A layer mask is a grayscale channel attached to the layer: white reveals,
+    black hides, gray = partial. Paint/fill the mask (white/black) to control
+    what shows, without altering the layer's pixels. Editable until baked with
+    apply_layer_mask.
+
+    Parameters:
+    - image_index: Target image index (default 0)
+    - layer_name: Layer to mask; defaults to the active layer
+    - mask_type: Initial mask contents:
+        "white"     - fully reveal the layer (default)
+        "black"     - fully hide the layer
+        "alpha"     - initialize from the layer's alpha channel
+        "selection" - initialize from the current selection
+      Unknown values raise an error.
+
+    Returns: {status, layer_name, mask_type}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("add_layer_mask", {
+            "image_index": image_index,
+            "layer_name": layer_name,
+            "mask_type": mask_type,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"add_layer_mask failed: {e}")
+
+
+@mcp.tool()
+def apply_layer_mask(
+    ctx: Context,
+    image_index: int = 0,
+    layer_name: str | None = None,
+    mode: str = "apply",
+) -> dict:
+    """Bake or drop a layer's mask.
+
+    - mode="apply" (default): permanently composites the mask into the layer's
+      pixels/alpha, then removes the mask.
+    - mode="discard": removes the mask and discards its effect (layer pixels
+      unchanged).
+
+    Errors if the layer has no mask.
+
+    Parameters:
+    - image_index: Target image index (default 0)
+    - layer_name: Layer whose mask to apply; defaults to the active layer
+    - mode: "apply" (default) or "discard"
+
+    Returns: {status, layer_name, mode}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("apply_layer_mask", {
+            "image_index": image_index,
+            "layer_name": layer_name,
+            "mode": mode,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"apply_layer_mask failed: {e}")
+
+
+@mcp.tool()
 def flatten_image(ctx: Context, image_index: int = 0) -> dict:
     """Flatten all layers into a single background layer.
 
@@ -2330,6 +2437,48 @@ def apply_noise(
     except Exception as e:
         traceback.print_exc()
         raise Exception(f"apply_noise failed: {e}")
+
+
+@mcp.tool()
+def apply_filter(
+    ctx: Context,
+    operation: str,
+    params: dict | None = None,
+    image_index: int = 0,
+    layer_name: str | None = None,
+    merge: bool = False,
+) -> dict:
+    """Apply a GEGL operation to a layer as a non-destructive, re-editable filter.
+
+    Generic gateway to GIMP 3.2's entire GEGL catalog (~200+ ops) via
+    Gimp.DrawableFilter. Unlike the per-effect tools (apply_gaussian_blur, etc.),
+    this exposes ANY operation with ANY parameters and, by default, applies it
+    non-destructively: the filter stacks on the layer, stays re-editable, and is
+    saved in the XCF.
+
+    Parameters:
+    - operation: GEGL operation name, e.g. "gegl:gaussian-blur", "gegl:unsharp-mask".
+    - params: dict of GEGL property name -> value. GEGL names use HYPHENS,
+      e.g. {"std-dev-x": 5, "std-dev-y": 5}. An unknown property FAILS LOUD —
+      the error lists the operation's valid property names so you can self-correct.
+    - image_index: Target image index (default 0).
+    - layer_name: Target layer; defaults to the active layer.
+    - merge: False (default) = non-destructive / re-editable; True = bake destructively.
+
+    Returns a status dict with the operation, target layer, and merged/appended state.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("apply_filter", {
+            "operation": operation, "params": params,
+            "image_index": image_index, "layer_name": layer_name, "merge": merge,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"apply_filter failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
