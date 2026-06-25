@@ -98,6 +98,8 @@ def _install_gi_stubs():
             HORIZONTAL="H", VERTICAL="V"),
         InterpolationType=types.SimpleNamespace(
             CUBIC="CUBIC", LINEAR="LINEAR", NONE="NONE"),
+        Selection=types.SimpleNamespace(
+            is_empty=MagicMock(name="selection_is_empty", return_value=True)),
     )
     repo_stub.Gimp = Gimp
     repo_stub.GLib = MagicMock()
@@ -184,6 +186,24 @@ def test_rotate_missing_angle_fails_loud(plugin, monkeypatch):
     assert out["status"] == "error"
     assert "angle" in out["error"]
     layer.transform_rotate_simple.assert_not_called()
+
+
+def test_transform_fails_loud_on_active_selection(plugin, plugin_mod, monkeypatch):
+    """rotate/scale/flip must refuse a whole-layer transform while a selection is
+    active (it would silently float only the selection); offset is unaffected."""
+    Gimp = plugin_mod.Gimp
+    layer = _make_layer()
+    _stub_image_layer(plugin, monkeypatch, layer)
+    monkeypatch.setattr(Gimp.Selection, "is_empty", lambda img: False)
+
+    out = plugin._transform_layer({"operation": "rotate", "angle": 90})
+    assert out["status"] == "error"
+    assert "selection" in out["error"].lower()
+    layer.transform_rotate_simple.assert_not_called()
+
+    # offset does not float a selection, so it still proceeds.
+    out2 = plugin._transform_layer({"operation": "offset", "offset_x": 5, "offset_y": 5})
+    assert out2["status"] == "success"
 
 
 def test_scale_computes_bbox_from_offset(plugin, monkeypatch):
