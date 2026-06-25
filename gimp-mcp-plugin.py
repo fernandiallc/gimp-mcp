@@ -57,6 +57,7 @@ class MCPPlugin(Gimp.PlugIn):
         self.port = port
         self.running = False
         self.socket = None
+        self._rebind_requested = False   # accept loop rebinds when another thread sets this
         self.server_thread = None
         self.context = {}
         exec("from gi.repository import Gimp", self.context)
@@ -154,13 +155,42 @@ class MCPPlugin(Gimp.PlugIn):
             print(f"GimpMCP server started on {self.host}:{self.port}")
 
             while self.running:
+                # Another thread asked for a rebind (restart). Do it here, on the
+                # loop's own thread, while we are NOT blocked in accept(). This is
+                # the only place self.socket is closed/re-created during normal run.
+                if self._rebind_requested:
+                    self._rebind_requested = False
+                    try:
+                        self._rebind_listen_socket()
+                    except Exception as e:
+                        # Fail loud, but keep the listener alive and retry next pass
+                        # rather than dying (which is the bug we are fixing).
+                        print(f"[MCP] Rebind failed, will retry: {e}", file=sys.stderr)
+                        self._rebind_requested = True
+                        import time
+                        time.sleep(1.0)
+                        continue
+
+                if self.socket is None:
+                    # Defensive: a prior rebind left us without a socket; request one.
+                    self._rebind_requested = True
+                    import time
+                    time.sleep(1.0)
+                    continue
+
                 try:
                     client, address = self.socket.accept()
                     print(f"Connected to client: {address}")
                 except socket.timeout:
                     continue
                 except OSError:
-                    break
+                    # Only an intentional shutdown (running=False, socket closed by
+                    # shutdown_server) should end the loop. Any other OSError (e.g.
+                    # a socket closed underneath us) re-loops; the rebind/None guards
+                    # above then recover the listener.
+                    if not self.running:
+                        break
+                    continue
                 client_thread = threading.Thread(target=self._handle_client, args=(client,))
                 client_thread.daemon = True
                 client_thread.start()
@@ -176,6 +206,23 @@ class MCPPlugin(Gimp.PlugIn):
         except Exception as e:
             print(f"Error in MCP server thread: {str(e)}")
             self.running = False
+
+    def _rebind_listen_socket(self):
+        """Close and re-create the listening socket. MUST be called only from the
+        accept-loop thread (_start_server_thread); never from a handler/main thread."""
+        print("Rebinding MCP listening socket...")
+        if self.socket:
+            try:
+                self.socket.close()
+            except Exception:
+                pass
+            self.socket = None
+        self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.socket.settimeout(1.0)
+        self.socket.bind((self.host, self.port))
+        self.socket.listen(1)
+        print(f"MCP server re-bound on {self.host}:{self.port}")
 
     def run(self, procedure, config, run_data):
         """Menu handler: start the server."""
@@ -401,6 +448,10 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._merge_visible_layers(j.get("params", {}))
             elif "type" in j and j["type"] == "list_layers":
                 return self._list_layers(j.get("params", {}))
+            elif "type" in j and j["type"] == "add_layer_mask":
+                return self._add_layer_mask(j.get("params", {}))
+            elif "type" in j and j["type"] == "apply_layer_mask":
+                return self._apply_layer_mask(j.get("params", {}))
             # ── Category 6: Color & Paint ─────────────────────────────────────
             elif "type" in j and j["type"] == "fill_layer":
                 return self._fill_layer(j.get("params", {}))
@@ -440,6 +491,8 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._apply_vignette(j.get("params", {}))
             elif "type" in j and j["type"] == "apply_noise":
                 return self._apply_noise(j.get("params", {}))
+            elif "type" in j and j["type"] == "apply_filter":
+                return self._apply_filter(j.get("params", {}))
             # ── Category 9: Export Pipelines ──────────────────────────────────
             elif "type" in j and j["type"] == "export_icon_sizes":
                 return self._export_icon_sizes(j.get("params", {}))
@@ -535,7 +588,19 @@ class MCPPlugin(Gimp.PlugIn):
             # Extract parameters
             max_width = params.get("max_width")
             max_height = params.get("max_height")
-            
+
+            # Output format / quality (default PNG keeps current behavior exactly).
+            out_format = str(params.get("format", "png")).lower()
+            if out_format in ("jpg", "jpeg"):
+                out_format = "jpeg"
+            elif out_format != "png":
+                out_format = "png"          # fail soft to PNG on unknown format
+            try:
+                quality = int(params.get("quality", 85))
+            except (TypeError, ValueError):
+                quality = 85
+            quality = max(1, min(100, quality))   # clamp to valid JPEG range
+
             # Extract region parameters if provided
             region = params.get("region", {})
             
@@ -720,8 +785,9 @@ class MCPPlugin(Gimp.PlugIn):
                                 pass
                         raise RuntimeError(f"Failed to scale image from {current_width}x{current_height} to {target_width}x{target_height}: {scale_error}")
         
-            # Create a temporary file for export
-            temp_fd, temp_path = tempfile.mkstemp(suffix='.png')
+            # Create a temporary file for export (suffix matches target format)
+            suffix = '.jpg' if out_format == 'jpeg' else '.png'
+            temp_fd, temp_path = tempfile.mkstemp(suffix=suffix)
             os.close(temp_fd)  # Close the file descriptor as GIMP will handle the file
             
             try:
@@ -744,68 +810,99 @@ class MCPPlugin(Gimp.PlugIn):
                 if not drawable:
                     drawable = layers[0]
                 
-                # Export the image to PNG
-                try:
-                    # In GIMP 3.0, use the simplified export approach
+                if out_format == "jpeg":
+                    # JPEG export via file-jpeg-export (GIMP 3.0/3.2 export proc,
+                    # matching the file-png-export naming used by the PNG path).
+                    # quality is a gdouble 0.0-1.0 (see _export_to_path /100.0).
                     from gi.repository import Gio
                     file_obj = Gio.File.new_for_path(temp_path)
-                    
-                    # Use file-png-export with the correct parameters for GIMP 3.0
-                    export_proc = Gimp.get_pdb().lookup_procedure('file-png-export')
+                    export_proc = Gimp.get_pdb().lookup_procedure('file-jpeg-export')
                     if not export_proc:
                         return {
                             "status": "error",
-                            "error": "PNG export procedure not found"
+                            "error": "JPEG export procedure 'file-jpeg-export' not found"
                         }
-                    
                     export_config = export_proc.create_config()
                     export_config.set_property('image', final_image)
                     export_config.set_property('file', file_obj)
-                    # Try different property names that might exist
+                    # drawable property name varies by build — tolerant like the PNG path.
                     try:
                         export_config.set_property('drawable', drawable)
                     except Exception:
                         try:
                             export_config.set_property('drawables', [drawable])
                         except Exception:
-                            # Some export procedures might not need drawable specification
                             pass
-                    
-                    result = export_proc.run(export_config)
-                    print(f"Export result: {result}")
-                    
-                except Exception as export_error:
-                    print(f"Export error: {export_error}")
-                    # Fallback: try using the PDB directly with correct arguments
+                    # Fail loud on quality: 'quality' is a documented property of
+                    # file-jpeg-export; silently dropping it would make the quality
+                    # param a no-op. Let any error raise into the outer except.
+                    export_config.set_property('quality', quality / 100.0)
+                    run_result = export_proc.run(export_config)
+                    print(f"JPEG export result: {run_result}", file=sys.stderr)
+
+                else:
+                    # Export the image to PNG
                     try:
+                        # In GIMP 3.0, use the simplified export approach
                         from gi.repository import Gio
                         file_obj = Gio.File.new_for_path(temp_path)
-                        
-                        # Try alternative approach using Gimp.file_save with correct number of arguments
-                        Gimp.file_save(Gimp.RunMode.NONINTERACTIVE, final_image, file_obj)
-                        print("Fallback export successful")
-                    except Exception as fallback_error:
-                        print(f"Fallback export error: {fallback_error}")
-                        # Try another fallback using gimp-file-save PDB procedure
-                        try:
-                            pdb = Gimp.get_pdb()
-                            save_proc = pdb.lookup_procedure('gimp-file-save')
-                            if save_proc:
-                                save_config = save_proc.create_config()
-                                save_config.set_property('image', final_image)
-                                save_config.set_property('file', file_obj)
-                                save_result = save_proc.run(save_config)
-                                print(f"PDB save result: {save_result}")
-                            else:
-                                return {
-                                    "status": "error",
-                                    "error": f"All export methods failed: {export_error}, fallback: {fallback_error}"
-                                }
-                        except Exception as pdb_error:
+
+                        # Use file-png-export with the correct parameters for GIMP 3.0
+                        export_proc = Gimp.get_pdb().lookup_procedure('file-png-export')
+                        if not export_proc:
                             return {
                                 "status": "error",
-                                "error": f"All export methods failed: {export_error}, fallback: {fallback_error}, PDB: {pdb_error}"
+                                "error": "PNG export procedure not found"
                             }
+
+                        export_config = export_proc.create_config()
+                        export_config.set_property('image', final_image)
+                        export_config.set_property('file', file_obj)
+                        # Try different property names that might exist
+                        try:
+                            export_config.set_property('drawable', drawable)
+                        except Exception:
+                            try:
+                                export_config.set_property('drawables', [drawable])
+                            except Exception:
+                                # Some export procedures might not need drawable specification
+                                pass
+
+                        result = export_proc.run(export_config)
+                        print(f"Export result: {result}")
+
+                    except Exception as export_error:
+                        print(f"Export error: {export_error}")
+                        # Fallback: try using the PDB directly with correct arguments
+                        try:
+                            from gi.repository import Gio
+                            file_obj = Gio.File.new_for_path(temp_path)
+
+                            # Try alternative approach using Gimp.file_save with correct number of arguments
+                            Gimp.file_save(Gimp.RunMode.NONINTERACTIVE, final_image, file_obj)
+                            print("Fallback export successful")
+                        except Exception as fallback_error:
+                            print(f"Fallback export error: {fallback_error}")
+                            # Try another fallback using gimp-file-save PDB procedure
+                            try:
+                                pdb = Gimp.get_pdb()
+                                save_proc = pdb.lookup_procedure('gimp-file-save')
+                                if save_proc:
+                                    save_config = save_proc.create_config()
+                                    save_config.set_property('image', final_image)
+                                    save_config.set_property('file', file_obj)
+                                    save_result = save_proc.run(save_config)
+                                    print(f"PDB save result: {save_result}")
+                                else:
+                                    return {
+                                        "status": "error",
+                                        "error": f"All export methods failed: {export_error}, fallback: {fallback_error}"
+                                    }
+                            except Exception as pdb_error:
+                                return {
+                                    "status": "error",
+                                    "error": f"All export methods failed: {export_error}, fallback: {fallback_error}, PDB: {pdb_error}"
+                                }
                 
                 # Read the exported file and encode as base64
                 with open(temp_path, 'rb') as f:
@@ -820,7 +917,7 @@ class MCPPlugin(Gimp.PlugIn):
                     "status": "success",
                     "results": {
                         "image_data": encoded_image,
-                        "format": "png",
+                        "format": out_format,
                         "width": final_width,
                         "height": final_height,
                         "original_width": orig_img_width,
@@ -1454,26 +1551,17 @@ class MCPPlugin(Gimp.PlugIn):
             }
 
     def _restart_server(self):
-        """Gracefully restart the MCP socket server in-place."""
-        try:
-            print("Restarting MCP server socket...")
-            # Close existing socket to force reconnect on next client call
-            if self.socket:
-                try:
-                    self.socket.close()
-                except Exception:
-                    pass
-                self.socket = None
+        """Request an in-place restart of the MCP socket server.
 
-            # Re-bind a fresh socket
-            import time
-            time.sleep(0.3)
-            self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            self.socket.settimeout(1.0)
-            self.socket.bind((self.host, self.port))
-            self.socket.listen(1)
-            print(f"MCP server restarted on {self.host}:{self.port}")
+        Does NOT touch the socket from this (handler/main) thread — that races the
+        background accept loop and silently kills the listener. Instead we set a
+        flag; the accept loop (_start_server_thread), which wakes at least every
+        1.0s on socket.timeout, performs the close+rebind on its own thread and
+        keeps serving. Returns immediately.
+        """
+        try:
+            print("Requesting MCP server socket rebind...")
+            self._rebind_requested = True
             return {
                 "status": "success",
                 "results": {"restarted": True, "host": self.host, "port": self.port}
@@ -2705,6 +2793,83 @@ class MCPPlugin(Gimp.PlugIn):
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
+    def _add_mask_type_from_string(self, mask_type):
+        """Map mask_type string to Gimp.AddMaskType; raise on unknown (fail loud)."""
+        table = {
+            "white":     Gimp.AddMaskType.WHITE,
+            "black":     Gimp.AddMaskType.BLACK,
+            "alpha":     Gimp.AddMaskType.ALPHA,
+            "selection": Gimp.AddMaskType.SELECTION,
+        }
+        key = str(mask_type).lower()
+        if key not in table:
+            raise RuntimeError(
+                f"Unknown mask_type '{mask_type}' (expected one of: {', '.join(table)})"
+            )
+        return table[key]
+
+    def _add_layer_mask(self, params):
+        """Create and attach a layer mask (non-destructive)."""
+        try:
+            image_index = int(params.get("image_index", 0))
+            layer_name  = params.get("layer_name", None)
+            layer_index = params.get("layer_index", None)
+            if layer_index is not None:
+                layer_index = int(layer_index)
+            mask_type   = params.get("mask_type", "white")
+            mask_enum   = self._add_mask_type_from_string(mask_type)  # raises on unknown
+            image = self._get_image(image_index)
+            layer = self._resolve_layer(image, layer_name, layer_index)
+            if layer.get_mask() is not None:
+                raise RuntimeError(f"Layer '{layer.get_name()}' already has a mask")
+            image.undo_group_start()
+            try:
+                mask = layer.create_mask(mask_enum)
+                layer.add_mask(mask)
+            finally:
+                image.undo_group_end()
+            Gimp.displays_flush()
+            return {"status": "success", "results": {
+                "status": "success",
+                "layer_name": layer.get_name(),
+                "mask_type": str(mask_type).lower(),
+            }}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _apply_layer_mask(self, params):
+        """Bake (apply) or drop (discard) a layer's mask."""
+        try:
+            image_index = int(params.get("image_index", 0))
+            layer_name  = params.get("layer_name", None)
+            layer_index = params.get("layer_index", None)
+            if layer_index is not None:
+                layer_index = int(layer_index)
+            mode = str(params.get("mode", "apply")).lower()
+            mode_table = {
+                "apply":   Gimp.MaskApplyMode.APPLY,
+                "discard": Gimp.MaskApplyMode.DISCARD,
+            }
+            if mode not in mode_table:
+                raise RuntimeError(f"Unknown mode '{mode}' (expected 'apply' or 'discard')")
+            image = self._get_image(image_index)
+            layer = self._resolve_layer(image, layer_name, layer_index)
+            if layer.get_mask() is None:
+                raise RuntimeError(f"Layer '{layer.get_name()}' has no mask to {mode}")
+            image.undo_group_start()
+            try:
+                layer.remove_mask(mode_table[mode])
+            finally:
+                image.undo_group_end()
+            Gimp.displays_flush()
+            return {"status": "success", "results": {
+                "status": "success",
+                "layer_name": layer.get_name(),
+                "mode": mode,
+            }}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
     def _flatten_image(self, params):
         """Flatten all layers."""
         try:
@@ -3552,6 +3717,60 @@ class MCPPlugin(Gimp.PlugIn):
                 image.undo_group_end()
             Gimp.displays_flush()
             return {"status": "success", "results": {"status": "success"}}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _apply_filter(self, params):
+        """Apply a GEGL op as a non-destructive (or merged) Gimp.DrawableFilter."""
+        try:
+            operation = params.get("operation")
+            if not operation:
+                raise RuntimeError(
+                    "apply_filter requires 'operation' (e.g. 'gegl:gaussian-blur')"
+                )
+            raw_params  = params.get("params") or {}
+            image_index = int(params.get("image_index", 0))
+            layer_name  = params.get("layer_name", None)
+            merge       = bool(params.get("merge", False))
+
+            image    = self._get_image(image_index)
+            drawable = self._resolve_layer(image, layer_name, None)
+
+            # Verified: Gimp.DrawableFilter.new(drawable, operation_name, name)
+            f = Gimp.DrawableFilter.new(drawable, operation, operation)
+            cfg = f.get_config()
+
+            # FAIL LOUD on an unknown/invalid GEGL property — never silently no-op
+            # (this is exactly what the legacy _apply_gegl_filter gets wrong).
+            for k, v in raw_params.items():
+                try:
+                    cfg.set_property(k, v)
+                except (TypeError, ValueError) as prop_err:
+                    valid = [p.name for p in cfg.list_properties()]
+                    raise RuntimeError(
+                        f"Invalid property '{k}' for operation '{operation}': "
+                        f"{prop_err}. Valid properties: {valid}"
+                    )
+
+            f.update()
+
+            image.undo_group_start()
+            try:
+                if merge:
+                    drawable.merge_filter(f)    # destructive bake
+                else:
+                    drawable.append_filter(f)   # NDE: re-editable, stored in XCF
+            finally:
+                image.undo_group_end()
+
+            Gimp.displays_flush()
+            return {"status": "success", "results": {
+                "status":    "success",
+                "operation": operation,
+                "layer":     drawable.get_name(),
+                "merged":    merge,
+                "mode":      "merged" if merge else "appended",
+            }}
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
