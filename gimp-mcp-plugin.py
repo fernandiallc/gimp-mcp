@@ -816,29 +816,55 @@ class MCPPlugin(Gimp.PlugIn):
                     # quality is a gdouble 0.0-1.0 (see _export_to_path /100.0).
                     from gi.repository import Gio
                     file_obj = Gio.File.new_for_path(temp_path)
+                    # JPEG has no alpha: composite onto a WHITE background so transparent
+                    # pixels render white instead of an arbitrary fill color. Flatten a
+                    # DUPLICATE so the live image is never mutated (final_image may be it).
+                    jpeg_src = final_image.duplicate()
+                    try:
+                        from gi.repository import Gegl
+                        prev_bg = Gimp.context_get_background()
+                        Gimp.context_set_background(Gegl.Color.new("white"))
+                        jpeg_src.flatten()
+                        Gimp.context_set_background(prev_bg)
+                    except Exception:
+                        try:
+                            jpeg_src.flatten()
+                        except Exception:
+                            pass
+                    jpeg_drawable = (jpeg_src.get_layers() or [drawable])[0]
                     export_proc = Gimp.get_pdb().lookup_procedure('file-jpeg-export')
                     if not export_proc:
+                        try:
+                            jpeg_src.delete()
+                        except Exception:
+                            pass
                         return {
                             "status": "error",
                             "error": "JPEG export procedure 'file-jpeg-export' not found"
                         }
                     export_config = export_proc.create_config()
-                    export_config.set_property('image', final_image)
+                    export_config.set_property('image', jpeg_src)
                     export_config.set_property('file', file_obj)
                     # drawable property name varies by build — tolerant like the PNG path.
                     try:
-                        export_config.set_property('drawable', drawable)
+                        export_config.set_property('drawable', jpeg_drawable)
                     except Exception:
                         try:
-                            export_config.set_property('drawables', [drawable])
+                            export_config.set_property('drawables', [jpeg_drawable])
                         except Exception:
                             pass
                     # Fail loud on quality: 'quality' is a documented property of
                     # file-jpeg-export; silently dropping it would make the quality
                     # param a no-op. Let any error raise into the outer except.
                     export_config.set_property('quality', quality / 100.0)
-                    run_result = export_proc.run(export_config)
-                    print(f"JPEG export result: {run_result}", file=sys.stderr)
+                    try:
+                        run_result = export_proc.run(export_config)
+                        print(f"JPEG export result: {run_result}", file=sys.stderr)
+                    finally:
+                        try:
+                            jpeg_src.delete()   # drop the temporary flattened copy
+                        except Exception:
+                            pass
 
                 else:
                     # Export the image to PNG
