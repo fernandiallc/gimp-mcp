@@ -9,10 +9,25 @@ import logging
 import base64
 import traceback
 import time
+import tempfile
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from uuid import uuid4
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("GimpMCPServer")
+
+# Persistent rotating log for post-mortem debugging. Sibling of the basicConfig stderr
+# handler — it writes to a FILE, NEVER to sys.stdout: stdout is the JSON-RPC stdio channel
+# and any byte written there corrupts the MCP protocol.
+LOG_FILE = Path(tempfile.gettempdir()) / "gimp_mcp_server.log"
+if not any(isinstance(h, RotatingFileHandler) for h in logger.handlers):
+    _file_handler = RotatingFileHandler(
+        LOG_FILE, maxBytes=2 * 1024 * 1024, backupCount=3, encoding="utf-8"
+    )
+    _file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+    logger.addHandler(_file_handler)
+    logger.setLevel(logging.INFO)
 
 GIMP_HOST = 'localhost'
 GIMP_PORT = 9877
@@ -21,6 +36,12 @@ GIMP_CONNECT_TIMEOUT = 10   # seconds — fail fast if the GIMP plugin isn't lis
 # tens of seconds; a flat 10s timeout aborted them mid-flight and a crash followed on the
 # next call. Widen the timeout for recv once connected.
 GIMP_OP_TIMEOUT = 300       # seconds
+
+# Wire-protocol version. Bump when the request/response envelope or the set of
+# handler return shapes changes incompatibly. The plugin reports its own value
+# inside get_gimp_info; check_server() compares the two and warns (non-fatally)
+# on drift so a stale plugin is diagnosable instead of silently misbehaving.
+PROTOCOL_VERSION = 1
 
 class GimpConnection:
     def __init__(self, host=GIMP_HOST, port=GIMP_PORT):
@@ -55,7 +76,12 @@ class GimpConnection:
     def send_command(self, command_type, params=None):
         if not self.sock:
             self.connect()
+        # req_id is LOCAL ONLY — never added to `command`, so the wire payload stays
+        # byte-identical (contract / back-compat intact). It threads send/recv log lines
+        # so one operation is traceable in the rotating log file.
+        req_id = uuid4().hex[:8]
         command = {"type": command_type, "params": params or {"args": []}}
+        logger.info(f"[{req_id}] -> {command_type}")
         try:
             self.sock.sendall(json.dumps(command).encode('utf-8') + b'\n')
             response_data = b''
@@ -69,9 +95,20 @@ class GimpConnection:
                     break
                 except (json.JSONDecodeError, UnicodeDecodeError):
                     continue
-            return json.loads(response_data.decode('utf-8'))
+            result = json.loads(response_data.decode('utf-8'))
+            if isinstance(result, dict) and result.get("status") != "success":
+                # Capture the plugin-provided traceback here — tool wrappers raise only the
+                # short error string, so without this the stack trace is lost.
+                logger.error(
+                    f"[{req_id}] <- {command_type} status={result.get('status')} "
+                    f"error={result.get('error', 'Unknown error')}\n"
+                    f"{result.get('traceback', '')}".rstrip()
+                )
+            else:
+                logger.info(f"[{req_id}] <- {command_type} ok")
+            return result
         except Exception as e:
-            logger.error(f"Communication error: {e}")
+            logger.error(f"[{req_id}] communication error: {e}")
             raise Exception(f"Error communicating with GIMP: {e}")
         finally:
             self.disconnect()
@@ -128,6 +165,8 @@ def check_server(ctx: Context) -> dict:
     - connected: bool
     - host / port: where it tried
     - gimp_version: if connected successfully
+    - protocol_version: plugin-reported wire version (None if the plugin predates the handshake)
+    - protocol_warning: present only on version drift; non-fatal
     - error: description if not connected
 
     Use this before any other operation to verify the GIMP plugin is running.
@@ -137,8 +176,23 @@ def check_server(ctx: Context) -> dict:
         test_conn = GimpConnection(GIMP_HOST, GIMP_PORT)
         test_conn.connect()
         result = test_conn.send_command("get_gimp_info")
-        version = result.get("results", {}).get("version", {}).get("version_method", "unknown")
-        return {"connected": True, "host": GIMP_HOST, "port": GIMP_PORT, "gimp_version": version}
+        results = result.get("results", {})
+        version = results.get("version", {}).get("version_method", "unknown")
+        plugin_protocol = results.get("protocol_version")   # None for pre-handshake plugins
+        out = {
+            "connected": True,
+            "host": GIMP_HOST,
+            "port": GIMP_PORT,
+            "gimp_version": version,
+            "protocol_version": plugin_protocol,
+        }
+        if plugin_protocol != PROTOCOL_VERSION:
+            out["protocol_warning"] = (
+                f"Protocol version mismatch: server speaks v{PROTOCOL_VERSION}, "
+                f"plugin reports v{plugin_protocol}. Update gimp-mcp-plugin.py in "
+                f"GIMP to match the server. Connection is still usable."
+            )
+        return out
     except Exception as e:
         return {"connected": False, "host": GIMP_HOST, "port": GIMP_PORT, "error": str(e)}
 
@@ -416,6 +470,61 @@ def get_state_snapshot(
     except Exception as e:
         traceback.print_exc()
         raise Exception(f"get_state_snapshot failed: {e}")
+
+
+@mcp.tool()
+def get_thumbnail(
+    ctx: Context,
+    image_index: int = 0,
+    max_size: int = 512,
+    format: str = "jpeg",
+    quality: int = 85,
+) -> Image:
+    """Fast in-memory preview of an open image — skips the temp-file export pipeline.
+
+    Low-latency cousin of get_state_snapshot / get_image_bitmap. Asks GIMP for its
+    built-in composited thumbnail (Gimp.Image.get_thumbnail) and encodes it straight
+    from memory via GdkPixbuf — no duplicate -> flatten -> scale -> tempfile -> read
+    round trip. Prefer it when you just need to SEE the current state quickly/cheaply.
+
+    Parameters:
+    - image_index: Which open image to preview (default 0 = most recent).
+    - max_size: Max width/height of the preview, in pixels. HARD-CAPPED at 1024 by the
+      GIMP thumbnail API; larger values are clamped to 1024. Aspect ratio preserved.
+    - format: "jpeg" (default, smallest payload — best for token economy) or "png"
+      (lossless, preserves alpha). JPEG flattens transparency onto a checker pattern.
+    - quality: JPEG quality 1-100 (default 85). Ignored when format="png".
+
+    Limitations — use get_image_bitmap instead when you need these:
+    - No region/zoom: renders the whole composited projection only.
+    - No resolution above 1024 px: get_image_bitmap is uncapped.
+
+    Returns:
+    - Image object (JPEG or PNG) of the current composited canvas.
+
+    Raises:
+    - Exception if no image is open or the thumbnail/encode fails.
+    """
+    try:
+        # API hard cap (gimp_image_get_thumbnail tops out at 1024 px). Clamp here so the
+        # limit is unit-testable without GIMP; the plugin re-clamps at the API boundary.
+        max_size = max(1, min(1024, max_size))
+        conn = get_gimp_connection()
+        params = {
+            "image_index": image_index,
+            "max_size": max_size,
+            "format": format,
+            "quality": quality,
+        }
+        result = conn.send_command("get_thumbnail", params)
+        if result["status"] == "success":
+            img_info = result["results"]
+            raw_bytes = base64.b64decode(img_info["image_data"])
+            return Image(data=raw_bytes, format=img_info.get("format", "png"))
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"get_thumbnail failed: {e}")
 
 
 @mcp.tool()

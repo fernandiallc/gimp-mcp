@@ -35,6 +35,10 @@ DEFAULT_TIMEOUT_SECONDS = 30  # Default timeout for operations
 # of blocking forever. This is a last-resort guard, not the normal completion path.
 MAIN_THREAD_CALL_TIMEOUT_SECONDS = 300
 
+# Wire-protocol version reported to the MCP server (see check_server handshake).
+# MUST stay numerically identical to PROTOCOL_VERSION in gimp_mcp_server.py.
+PROTOCOL_VERSION = 1
+
 
 def N_(message): return message
 def _(message): return GLib.dgettext(None, message)
@@ -363,12 +367,14 @@ class MCPPlugin(Gimp.PlugIn):
             elif "type" in j and j["type"] == "get_context_state":
                 return self._get_context_state()
             elif "type" in j and j["type"] == "check_server":
-                return {"status": "success", "results": {"running": True, "port": self.port}}
+                return {"status": "success", "results": {"running": True, "port": self.port, "protocol_version": PROTOCOL_VERSION}}
             elif "type" in j and j["type"] == "restart_server":
                 return self._restart_server()
             elif "type" in j and j["type"] == "new_canvas":
                 params = j.get("params", {})
                 return self._new_canvas(params)
+            elif "type" in j and j["type"] == "get_thumbnail":
+                return self._get_thumbnail(j.get("params", {}))
             # ── Category 1: File Operations ──────────────────────────────────
             elif "type" in j and j["type"] == "open_image":
                 return self._open_image(j.get("params", {}))
@@ -995,6 +1001,78 @@ class MCPPlugin(Gimp.PlugIn):
                 "traceback": traceback.format_exc()
             }
 
+    def _get_thumbnail(self, params=None):
+        """Fast preview via GIMP's built-in thumbnail + in-memory GdkPixbuf encode.
+
+        Skips the duplicate -> flatten -> scale -> tempfile -> read pipeline of
+        _get_current_image_bitmap. Renders the composited projection only (no region).
+        Deliberately writes nothing to stdout to stay fast and quiet.
+        """
+        if params is None:
+            params = {}
+
+        # Output format / quality — mirror _get_current_image_bitmap normalization.
+        out_format = str(params.get("format", "jpeg")).lower()
+        if out_format in ("jpg", "jpeg"):
+            out_format = "jpeg"
+        elif out_format != "png":
+            out_format = "png"          # fail soft to PNG on unknown format
+        try:
+            quality = int(params.get("quality", 85))
+        except (TypeError, ValueError):
+            quality = 85
+        quality = max(1, min(100, quality))   # clamp to valid JPEG range
+
+        # max_size is HARD-CAPPED at 1024 by gimp_image_get_thumbnail; clamp at the API
+        # boundary so a raw wire client (bypassing the server) can't trip the cap.
+        try:
+            max_size = int(params.get("max_size", 512))
+        except (TypeError, ValueError):
+            max_size = 512
+        max_size = max(1, min(1024, max_size))
+
+        try:
+            image_index = int(params.get("image_index", 0))
+        except (TypeError, ValueError):
+            image_index = 0
+        try:
+            image = self._get_image(image_index)
+        except RuntimeError as e:
+            return {"status": "error", "error": str(e)}
+
+        try:
+            # PNG keeps alpha; JPEG has no alpha so flatten transparency onto checks.
+            alpha = (Gimp.PixbufTransparency.KEEP_ALPHA if out_format == "png"
+                     else Gimp.PixbufTransparency.SMALL_CHECKS)
+            pixbuf = image.get_thumbnail(max_size, max_size, alpha)
+            if pixbuf is None:
+                return {"status": "error",
+                        "error": "Gimp.Image.get_thumbnail returned no pixbuf"}
+
+            # save_to_bufferv -> (ok, bytes); raises GLib.Error on failure (fail loud).
+            if out_format == "jpeg":
+                ok, buf = pixbuf.save_to_bufferv("jpeg", ["quality"], [str(quality)])
+            else:
+                ok, buf = pixbuf.save_to_bufferv("png", [], [])
+
+            encoded = base64.b64encode(bytes(buf)).decode("utf-8")
+            return {
+                "status": "success",
+                "results": {
+                    "image_data": encoded,
+                    "format": out_format,
+                    "width": pixbuf.get_width(),
+                    "height": pixbuf.get_height(),
+                    "original_width": image.get_width(),
+                    "original_height": image.get_height(),
+                    "encoding": "base64",
+                },
+            }
+        except (GLib.Error, RuntimeError, AttributeError, OSError, ValueError) as e:
+            return {"status": "error",
+                    "error": f"Thumbnail encode failed: {e}",
+                    "traceback": traceback.format_exc()}
+
     def _get_current_image_metadata(self):
         """Get comprehensive metadata about the current image without bitmap data."""
         try:
@@ -1470,7 +1548,8 @@ class MCPPlugin(Gimp.PlugIn):
             except Exception as sys_error:
                 print(f"Error getting system info: {sys_error}")
                 gimp_info["system"] = {"error": str(sys_error)}
-            
+
+            gimp_info["protocol_version"] = PROTOCOL_VERSION
             return {
                 "status": "success",
                 "results": gimp_info
