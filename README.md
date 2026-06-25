@@ -126,6 +126,33 @@ echo "Installed into: $GIMP_DIR/plug-ins/gimp-mcp-plugin"
 ```
 Replace `<VERSION>` with your GIMP major.minor (e.g. `3.2`). No chmod needed on Windows. Just copy and restart GIMP.
 
+#### Windows: `deploy.ps1` (install / update / drift check)
+
+On Windows you can skip the manual copy. From the repo root in PowerShell:
+
+```powershell
+# Install or update the plugin (creates the subfolder if needed):
+.\deploy.ps1
+
+# Check only — compares installed vs repo by SHA-256, writes nothing:
+.\deploy.ps1 -Check
+```
+
+`deploy.ps1` copies `gimp-mcp-plugin.py` into:
+
+```text
+%APPDATA%\GIMP\3.2\plug-ins\gimp-mcp-plugin\gimp-mcp-plugin.py
+```
+
+It resolves the folder from `%APPDATA%` (no hardcoded user) and prefers GIMP **3.2**,
+falling back to the newest installed `3.x` version folder so a GIMP minor upgrade
+doesn't silently break the install. After installing it prints the next steps:
+restart GIMP, run **Tools > MCP > Start MCP Server**, then `/mcp` in Claude Code to
+reconnect.
+
+`-Check` exit codes: `0` in-sync, `10` drift, `20` not-installed — safe to run while
+GIMP is closed; it never modifies anything.
+
 > For all platforms: [GIMP Plugin Installation Guide](https://en.wikibooks.org/wiki/GIMP/Installing_Plugins)
 
 ### 3. Start the MCP Server in GIMP
