@@ -95,3 +95,136 @@ def test_apply_filter_raises_on_error_envelope(fake_conn_factory):
     fake_conn_factory({"status": "error", "error": "Invalid property 'foo'. Valid properties: ['std-dev-x']"})
     with pytest.raises(Exception, match="foo"):
         s.apply_filter(ctx=None, operation="gegl:gaussian-blur", params={"foo": 1})
+
+
+# alpha_to_selection ----------------------------------------------------------
+
+def test_alpha_to_selection_sends_correct_command(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success", "results": {"status": "success"}})
+    out = s.alpha_to_selection(ctx=None, layer_name="Logo")
+    name, params = fake.sent[0]
+    assert name == "alpha_to_selection"
+    assert params == {
+        "layer_name": "Logo",
+        "layer_index": None,
+        "operation": "replace",
+        "image_index": 0,
+    }
+    assert out == {"status": "success"}        # returns result["results"]
+
+
+def test_alpha_to_selection_index_and_operation_propagate(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success", "results": {"status": "success"}})
+    s.alpha_to_selection(ctx=None, layer_index=2, operation="add", image_index=1)
+    _, params = fake.sent[0]
+    assert params["layer_index"] == 2
+    assert params["operation"] == "add"
+    assert params["image_index"] == 1
+    assert params["layer_name"] is None
+
+
+def test_alpha_to_selection_raises_on_error_envelope(fake_conn_factory):
+    fake_conn_factory({"status": "error", "error": "Layer 'Nope' not found"})
+    with pytest.raises(Exception, match="Layer 'Nope' not found"):
+        s.alpha_to_selection(ctx=None, layer_name="Nope")
+
+
+# selection_to_channel --------------------------------------------------------
+
+def test_selection_to_channel_sends_correct_command(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success",
+                              "results": {"channel_name": "mask1", "channel_id": 42}})
+    out = s.selection_to_channel(ctx=None, name="mask1")
+    name, params = fake.sent[0]
+    assert name == "selection_to_channel"
+    assert params == {"name": "mask1", "image_index": 0}
+    assert out == {"channel_name": "mask1", "channel_id": 42}   # returns result["results"]
+
+
+def test_selection_to_channel_image_index_propagates(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success",
+                              "results": {"channel_name": "m", "channel_id": 7}})
+    s.selection_to_channel(ctx=None, name="m", image_index=2)
+    _, params = fake.sent[0]
+    assert params["name"] == "m"
+    assert params["image_index"] == 2
+
+
+def test_selection_to_channel_raises_on_error_envelope(fake_conn_factory):
+    fake_conn_factory({"status": "error",
+                       "error": "Cannot save channel: the current selection is empty"})
+    with pytest.raises(Exception, match="selection_to_channel failed.*selection is empty"):
+        s.selection_to_channel(ctx=None, name="mask1")
+
+
+# channel_to_selection --------------------------------------------------------
+
+def test_channel_to_selection_sends_correct_command(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success", "results": {"status": "success"}})
+    out = s.channel_to_selection(ctx=None, channel_name="saved sel",
+                                 operation="add", image_index=2)
+    name, params = fake.sent[0]
+    assert name == "channel_to_selection"
+    assert params == {
+        "channel_name": "saved sel",
+        "operation": "add",
+        "image_index": 2,
+    }
+    assert out == {"status": "success"}        # returns result["results"]
+
+
+def test_channel_to_selection_defaults(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success", "results": {"status": "success"}})
+    s.channel_to_selection(ctx=None, channel_name="mask1")
+    _, params = fake.sent[0]
+    assert params["operation"] == "replace"
+    assert params["image_index"] == 0
+
+
+def test_channel_to_selection_raises_on_error_envelope(fake_conn_factory):
+    fake_conn_factory({"status": "error",
+                       "error": "No channel named 'x'. Available: ['mask1']"})
+    with pytest.raises(Exception, match="channel_to_selection failed.*No channel named 'x'"):
+        s.channel_to_selection(ctx=None, channel_name="x")
+
+
+# select_contiguous (magic wand: seed + threshold, distinct from select_by_color) -
+
+def test_select_contiguous_sends_correct_command(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success", "results": {"status": "success"}})
+    out = s.select_contiguous(ctx=None, x=10, y=20)
+    name, params = fake.sent[0]
+    assert name == "select_contiguous"
+    assert params == {
+        "x": 10,
+        "y": 20,
+        "threshold": 15,
+        "sample_merged": False,
+        "operation": "replace",
+        "image_index": 0,
+        "layer_name": None,
+    }
+    assert out == {"status": "success"}        # returns result["results"]
+
+
+def test_select_contiguous_non_default_args_propagate(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success", "results": {"status": "success"}})
+    s.select_contiguous(ctx=None, x=5, y=5, threshold=80, sample_merged=True,
+                        operation="add", image_index=2, layer_name="bg")
+    _, params = fake.sent[0]
+    assert params == {
+        "x": 5,
+        "y": 5,
+        "threshold": 80,
+        "sample_merged": True,
+        "operation": "add",
+        "image_index": 2,
+        "layer_name": "bg",
+    }
+
+
+def test_select_contiguous_raises_on_error_envelope(fake_conn_factory):
+    fake_conn_factory({"status": "error",
+                       "error": "Seed point (10,20) is outside image bounds 4x4"})
+    with pytest.raises(Exception, match="select_contiguous failed.*outside image bounds"):
+        s.select_contiguous(ctx=None, x=10, y=20)
