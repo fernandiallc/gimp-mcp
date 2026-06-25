@@ -378,6 +378,8 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._export_image(j.get("params", {}))
             elif "type" in j and j["type"] == "batch_export":
                 return self._batch_export(j.get("params", {}))
+            elif "type" in j and j["type"] == "paste_as_layer":
+                return self._paste_as_layer(j.get("params", {}))
             # ── Category 2: Image Adjustments ────────────────────────────────
             elif "type" in j and j["type"] == "auto_levels":
                 return self._auto_levels(j.get("params", {}))
@@ -412,6 +414,8 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._rotate_image(j.get("params", {}))
             elif "type" in j and j["type"] == "flip_image":
                 return self._flip_image(j.get("params", {}))
+            elif "type" in j and j["type"] == "transform_layer":
+                return self._transform_layer(j.get("params", {}))
             elif "type" in j and j["type"] == "resize_canvas":
                 return self._resize_canvas(j.get("params", {}))
             # ── Category 4: Selections ────────────────────────────────────────
@@ -421,14 +425,22 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._select_ellipse(j.get("params", {}))
             elif "type" in j and j["type"] == "select_by_color":
                 return self._select_by_color(j.get("params", {}))
+            elif "type" in j and j["type"] == "select_contiguous":
+                return self._select_contiguous(j.get("params", {}))
             elif "type" in j and j["type"] == "select_all":
                 return self._select_all(j.get("params", {}))
             elif "type" in j and j["type"] == "select_none":
                 return self._select_none(j.get("params", {}))
             elif "type" in j and j["type"] == "invert_selection":
                 return self._invert_selection(j.get("params", {}))
+            elif "type" in j and j["type"] == "channel_to_selection":
+                return self._channel_to_selection(j.get("params", {}))
             elif "type" in j and j["type"] == "modify_selection":
                 return self._modify_selection(j.get("params", {}))
+            elif "type" in j and j["type"] == "alpha_to_selection":
+                return self._alpha_to_selection(j.get("params", {}))
+            elif "type" in j and j["type"] == "selection_to_channel":
+                return self._selection_to_channel(j.get("params", {}))
             # ── Category 5: Layer Operations ──────────────────────────────────
             elif "type" in j and j["type"] == "create_layer":
                 return self._create_layer(j.get("params", {}))
@@ -446,6 +458,8 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._flatten_image(j.get("params", {}))
             elif "type" in j and j["type"] == "merge_visible_layers":
                 return self._merge_visible_layers(j.get("params", {}))
+            elif "type" in j and j["type"] == "merge_down":
+                return self._merge_down(j.get("params", {}))
             elif "type" in j and j["type"] == "list_layers":
                 return self._list_layers(j.get("params", {}))
             elif "type" in j and j["type"] == "add_layer_mask":
@@ -1861,6 +1875,49 @@ class MCPPlugin(Gimp.PlugIn):
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
+    def _paste_as_layer(self, params):
+        """Load an external image file as a new layer in an existing image."""
+        try:
+            from gi.repository import Gio
+            image_index = int(params.get("image_index", 0))
+            file_path   = params.get("file_path", "")
+            position    = int(params.get("position", -1))
+            offset_x    = int(params.get("offset_x", 0))
+            offset_y    = int(params.get("offset_y", 0))
+            name        = params.get("name", None)
+            if not file_path:
+                return {"status": "error", "error": "file_path is required"}
+            if not os.path.isfile(file_path):
+                return {"status": "error", "error": f"File not found: {file_path}"}
+            image = self._get_image(image_index)
+            gio_file = Gio.File.new_for_path(file_path)
+            image.undo_group_start()
+            try:
+                # GIMP 3.0 PDB: load file flattened to a single layer for `image`.
+                layer = Gimp.file_load_layer(Gimp.RunMode.NONINTERACTIVE, image, gio_file)
+                if layer is None:
+                    return {"status": "error",
+                            "error": f"Could not load image as layer: {file_path}"}
+                image.insert_layer(layer, None, position)
+                if name is not None:
+                    layer.set_name(name)
+                if offset_x or offset_y:
+                    layer.set_offsets(offset_x, offset_y)
+            finally:
+                image.undo_group_end()
+            Gimp.displays_flush()
+            return {
+                "status": "success",
+                "results": {
+                    "layer_name": layer.get_name(),
+                    "layer_id":   layer.get_id(),
+                    "width":      layer.get_width(),
+                    "height":     layer.get_height(),
+                }
+            }
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
     def _save_xcf(self, params):
         """Save image as XCF."""
         try:
@@ -2454,6 +2511,109 @@ class MCPPlugin(Gimp.PlugIn):
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
+    def _transform_layer(self, params):
+        """Transform a single layer: rotate / scale / flip / offset.
+
+        transform_* methods live on Gimp.Item (Layer is an Item subclass).
+        Arbitrary rotate takes RADIANS. TransformResize.ADJUST grows the layer
+        to fit the result instead of clipping. Context state is saved/restored
+        via context_push/pop. Fails loud on unknown op or missing per-op params.
+        """
+        try:
+            import math
+            image_index   = int(params.get("image_index", 0))
+            operation     = str(params.get("operation", "")).lower()
+            layer_name    = params.get("layer_name", None)
+            layer_index   = params.get("layer_index", None)
+            interpolation = params.get("interpolation", "cubic")
+
+            if layer_index is not None:
+                layer_index = int(layer_index)
+
+            image = self._get_image(image_index)
+            layer = self._resolve_layer(image, layer_name, layer_index)
+
+            # A non-empty selection makes Gimp.Item.transform_* act on a FLOATING
+            # selection (only the selected pixels), not the whole layer — surprising and
+            # not what transform_layer means. Fail loud for the selection-sensitive ops;
+            # offset (set_offsets) is unaffected by the selection.
+            if operation in ("rotate", "scale", "flip") and not Gimp.Selection.is_empty(image):
+                return {
+                    "status": "error",
+                    "error": (f"Cannot {operation} the whole layer while a selection is "
+                              "active (it would transform only the selection as a floating "
+                              "layer). Clear it with select_none first."),
+                }
+
+            image.undo_group_start()
+            Gimp.context_push()
+            try:
+                Gimp.context_set_transform_resize(Gimp.TransformResize.ADJUST)
+                Gimp.context_set_interpolation(self._interp_from_string(interpolation))
+
+                if operation == "rotate":
+                    if params.get("angle") is None:
+                        raise ValueError("rotate requires 'angle' (degrees)")
+                    angle = float(params["angle"])
+                    simple = {
+                        90.0:   Gimp.RotationType.DEGREES90,
+                        180.0:  Gimp.RotationType.DEGREES180,
+                        270.0:  Gimp.RotationType.DEGREES270,
+                        -90.0:  Gimp.RotationType.DEGREES270,
+                        -180.0: Gimp.RotationType.DEGREES180,
+                        -270.0: Gimp.RotationType.DEGREES90,
+                    }
+                    if angle in simple:
+                        layer = layer.transform_rotate_simple(simple[angle], True, 0, 0)
+                    else:
+                        layer = layer.transform_rotate(math.radians(angle), True, 0, 0)
+
+                elif operation == "scale":
+                    sw = params.get("scale_width")
+                    sh = params.get("scale_height")
+                    if sw is None or sh is None:
+                        raise ValueError("scale requires 'scale_width' and 'scale_height'")
+                    sw, sh = int(sw), int(sh)
+                    if sw <= 0 or sh <= 0:
+                        raise ValueError("scale_width and scale_height must be positive")
+                    ox, oy = layer.get_offsets()  # _list_layers proves this is a 2-tuple
+                    layer = layer.transform_scale(ox, oy, ox + sw, oy + sh)
+
+                elif operation == "flip":
+                    axis = str(params.get("flip_axis", "")).lower()
+                    if axis not in ("horizontal", "vertical"):
+                        raise ValueError("flip requires flip_axis 'horizontal' or 'vertical'")
+                    orient = (Gimp.OrientationType.HORIZONTAL if axis == "horizontal"
+                              else Gimp.OrientationType.VERTICAL)
+                    layer = layer.transform_flip_simple(orient, True, 0.0)
+
+                elif operation == "offset":
+                    if params.get("offset_x") is None or params.get("offset_y") is None:
+                        raise ValueError("offset requires 'offset_x' and 'offset_y'")
+                    layer.set_offsets(int(params["offset_x"]), int(params["offset_y"]))
+
+                else:
+                    raise ValueError(
+                        f"Unknown operation '{operation}'; "
+                        "expected rotate|scale|flip|offset"
+                    )
+            finally:
+                Gimp.context_pop()
+                image.undo_group_end()
+
+            Gimp.displays_flush()
+            offsets = list(layer.get_offsets())
+            return {"status": "success", "results": {
+                "status":    "success",
+                "operation": operation,
+                "layer":     layer.get_name(),
+                "offsets":   offsets,
+                "width":     layer.get_width(),
+                "height":    layer.get_height(),
+            }}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
     def _resize_canvas(self, params):
         """Resize canvas without scaling content."""
         try:
@@ -2582,6 +2742,66 @@ class MCPPlugin(Gimp.PlugIn):
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
+    def _select_contiguous(self, params):
+        """Select a contiguous color region from a seed point (magic wand)."""
+        try:
+            image_index   = int(params.get("image_index", 0))
+            layer_name    = params.get("layer_name", None)
+            x             = float(params.get("x", 0))
+            y             = float(params.get("y", 0))
+            threshold     = int(params.get("threshold", 15))
+            sample_merged = bool(params.get("sample_merged", False))
+            operation     = params.get("operation", "replace")
+            image    = self._get_image(image_index)
+            drawable = self._resolve_layer(image, layer_name, None)
+            op = self._channel_ops_from_string(operation)
+            w = image.get_width()
+            h = image.get_height()
+            if not (0 <= x < w and 0 <= y < h):
+                raise RuntimeError(
+                    f"Seed point ({x:g},{y:g}) is outside image bounds {w}x{h}"
+                )
+            Gimp.context_push()
+            try:
+                Gimp.context_set_antialias(True)
+                Gimp.context_set_feather(False)
+                Gimp.context_set_sample_threshold_int(threshold)
+                Gimp.context_set_sample_merged(sample_merged)
+                Gimp.context_set_sample_transparent(False)
+                image.select_contiguous_color(op, drawable, x, y)
+            finally:
+                Gimp.context_pop()
+            Gimp.displays_flush()
+            return {"status": "success", "results": {"status": "success"}}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _channel_to_selection(self, params):
+        """Restore a saved channel as the active selection."""
+        try:
+            image_index  = int(params.get("image_index", 0))
+            channel_name = params.get("channel_name")
+            operation    = params.get("operation", "replace")
+            if not channel_name:
+                raise RuntimeError("channel_name is required")
+            image = self._get_image(image_index)
+            # By-name lookup over saved channels (only 2 call sites; no shared helper).
+            channel = next(
+                (c for c in image.get_channels() if c.get_name() == channel_name),
+                None,
+            )
+            if channel is None:
+                available = [c.get_name() for c in image.get_channels()]
+                raise RuntimeError(
+                    f"No channel named '{channel_name}'. Available: {available}"
+                )
+            op = self._channel_ops_from_string(operation)
+            image.select_item(op, channel)
+            Gimp.displays_flush()
+            return {"status": "success", "results": {"status": "success"}}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
     def _select_all(self, params):
         """Select entire canvas."""
         try:
@@ -2635,6 +2855,48 @@ class MCPPlugin(Gimp.PlugIn):
                 fn(image, amount)
             Gimp.displays_flush()
             return {"status": "success", "results": {"status": "success"}}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _alpha_to_selection(self, params):
+        """Set selection from a layer's alpha (non-transparent content)."""
+        try:
+            image_index = int(params.get("image_index", 0))
+            layer_name  = params.get("layer_name", None)
+            layer_index = params.get("layer_index", None)
+            operation   = params.get("operation", "replace")
+            image = self._get_image(image_index)
+            layer = self._resolve_layer(image, layer_name, layer_index)
+            op = self._channel_ops_from_string(operation)
+            # gimp_image_select_item(image, op, item): loads the layer's
+            # alpha-bearing region as the selection (whole bounds if fully opaque).
+            image.select_item(op, layer)
+            Gimp.displays_flush()
+            return {"status": "success", "results": {"status": "success"}}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _selection_to_channel(self, params):
+        """Save the current selection as a new named channel."""
+        try:
+            image_index = int(params.get("image_index", 0))
+            name        = params.get("name")
+            if not name:
+                return {"status": "error",
+                        "error": "selection_to_channel requires a 'name'"}
+            image = self._get_image(image_index)
+            # Fail loud on empty selection: saving it would create an all-zero
+            # channel that channel_to_selection later restores as nothing.
+            if Gimp.Selection.is_empty(image):
+                return {"status": "error",
+                        "error": "Cannot save channel: the current selection is empty"}
+            channel = Gimp.Selection.save(image)
+            channel.set_name(name)
+            Gimp.displays_flush()
+            return {"status": "success", "results": {
+                "channel_name": channel.get_name(),
+                "channel_id":   channel.get_id(),
+            }}
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
@@ -2921,6 +3183,59 @@ class MCPPlugin(Gimp.PlugIn):
                 image.undo_group_end()
             Gimp.displays_flush()
             return {"status": "success", "results": {"layer_name": merged.get_name(), "layer_id": merged.get_id()}}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _merge_type_from_string(self, merge_type):
+        """Map merge_type string to Gimp.MergeType; raise on unknown (fail loud)."""
+        table = {
+            "expand":      Gimp.MergeType.EXPAND_AS_NECESSARY,
+            "clip_image":  Gimp.MergeType.CLIP_TO_IMAGE,
+            "clip_bottom": Gimp.MergeType.CLIP_TO_BOTTOM_LAYER,
+        }
+        key = str(merge_type).lower()
+        if key not in table:
+            raise RuntimeError(
+                f"Unknown merge_type '{merge_type}' (expected one of: {', '.join(table)})"
+            )
+        return table[key]
+
+    def _merge_down(self, params):
+        """Merge the identified upper layer into the layer directly below it."""
+        try:
+            image_index = int(params.get("image_index", 0))
+            layer_name  = params.get("layer_name", None)
+            layer_index = params.get("layer_index", None)
+            if layer_index is not None:
+                layer_index = int(layer_index)
+            merge_type  = params.get("merge_type", "expand")
+            merge_enum  = self._merge_type_from_string(merge_type)  # raises on unknown
+
+            image = self._get_image(image_index)
+            layer = self._resolve_layer(image, layer_name, layer_index)
+
+            # Fail loud BEFORE the PDB call if there is no layer below to merge
+            # into; libgimp would otherwise raise a native error. Compare by id
+            # because PyGObject wrappers are not reliably identity-equal.
+            siblings = image.get_layers()
+            ids = [lyr.get_id() for lyr in siblings]
+            pos = ids.index(layer.get_id())
+            if pos == len(siblings) - 1:
+                raise RuntimeError(
+                    f"Layer '{layer.get_name()}' is the bottom-most layer; "
+                    "no layer below to merge into"
+                )
+
+            image.undo_group_start()
+            try:
+                merged = image.merge_down(layer, merge_enum)
+            finally:
+                image.undo_group_end()
+            Gimp.displays_flush()
+            return {"status": "success", "results": {
+                "layer_name": merged.get_name(),
+                "layer_id": merged.get_id(),
+            }}
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 

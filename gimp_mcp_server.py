@@ -706,6 +706,54 @@ def batch_export(
         raise Exception(f"batch_export failed: {e}")
 
 
+@mcp.tool()
+def paste_as_layer(
+    ctx: Context,
+    file_path: str,
+    position: int = -1,
+    offset_x: int = 0,
+    offset_y: int = 0,
+    name: str = None,
+    image_index: int = 0
+) -> dict:
+    """Load an external image file as a new layer inside an already-open image.
+
+    The file is loaded and flattened into a single layer, then inserted into the
+    target image at the given stack position. Use this to composite a logo, photo,
+    or texture onto an existing canvas. The pasted layer is sized to the loaded
+    file (it is NOT scaled to the canvas).
+
+    Parameters:
+    - file_path: Absolute path to the image file to load (PNG, JPEG, TIFF, WEBP, etc.)
+    - position: Stack position to insert at — 0 = top, -1 = top of stack (default -1)
+    - offset_x: Horizontal offset in pixels of the pasted layer (default 0)
+    - offset_y: Vertical offset in pixels of the pasted layer (default 0)
+    - name: Optional name for the new layer; if omitted, GIMP's default (filename) is kept
+    - image_index: Index of the target image (default 0 = first open image)
+
+    Returns:
+    - layer_name: name of the inserted layer
+    - layer_id: internal GIMP layer ID
+    - width / height: dimensions of the pasted layer in pixels
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("paste_as_layer", {
+            "file_path": file_path,
+            "position": position,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "name": name,
+            "image_index": image_index,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"paste_as_layer failed: {e}")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # CATEGORY 2 — Image Adjustments
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1236,6 +1284,63 @@ def flip_image(
 
 
 @mcp.tool()
+def transform_layer(
+    ctx: Context,
+    operation: str,
+    layer_name: str | None = None,
+    layer_index: int | None = None,
+    angle: float | None = None,
+    scale_width: int | None = None,
+    scale_height: int | None = None,
+    flip_axis: str | None = None,
+    offset_x: int | None = None,
+    offset_y: int | None = None,
+    interpolation: str = "cubic",
+    image_index: int = 0,
+) -> dict:
+    """Transform a single layer: rotate, scale, flip, or offset it (the layer
+    only, not the whole canvas). For whole-image transforms use rotate_image /
+    scale_image / flip_image.
+
+    Parameters:
+    - operation: one of "rotate", "scale", "flip", "offset"
+    - layer_name: target layer by name; if None and layer_index None, active layer
+    - layer_index: target layer by stack index (alternative to layer_name)
+    - angle: (rotate) degrees clockwise. 90/180/270 use the lossless simple path;
+             any other value is an arbitrary rotation using `interpolation`.
+    - scale_width / scale_height: (scale) target layer size in pixels; both required
+    - flip_axis: (flip) "horizontal" or "vertical"
+    - offset_x / offset_y: (offset) new absolute layer offset in pixels; both required
+    - interpolation: "cubic" (default), "linear", "none" (used by arbitrary rotate + scale)
+    - image_index: target image (default 0)
+
+    Returns: {status, operation, layer, offsets:[x,y], width, height}
+             reflecting the layer's post-transform geometry.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("transform_layer", {
+            "operation": operation,
+            "layer_name": layer_name,
+            "layer_index": layer_index,
+            "angle": angle,
+            "scale_width": scale_width,
+            "scale_height": scale_height,
+            "flip_axis": flip_axis,
+            "offset_x": offset_x,
+            "offset_y": offset_y,
+            "interpolation": interpolation,
+            "image_index": image_index,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"transform_layer failed: {e}")
+
+
+@mcp.tool()
 def resize_canvas(
     ctx: Context,
     width: int,
@@ -1386,6 +1491,89 @@ def select_by_color(
 
 
 @mcp.tool()
+def select_contiguous(
+    ctx: Context,
+    x: int,
+    y: int,
+    threshold: int = 15,
+    sample_merged: bool = False,
+    operation: str = "replace",
+    image_index: int = 0,
+    layer_name: str | None = None
+) -> dict:
+    """Select a contiguous color region from a seed point (magic wand / fuzzy select).
+
+    Flood-fills outward from the seed pixel, selecting only the connected region
+    of similar color. Unlike select_by_color (which selects ALL matching pixels
+    image-wide), this stops at the boundary of the touching region.
+
+    Parameters:
+    - x, y: Seed point coordinates in the drawable (pixels)
+    - threshold: Color similarity tolerance 0-255 (default 15); higher = larger region
+    - sample_merged: If True, sample the composite of all visible layers instead of
+      just the target drawable (default False)
+    - operation: "replace" (default), "add", "subtract", "intersect"
+    - image_index: Target image index (default 0)
+    - layer_name: Drawable to sample/select on; defaults to active layer
+
+    Returns status dict.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("select_contiguous", {
+            "x": x,
+            "y": y,
+            "threshold": threshold,
+            "sample_merged": sample_merged,
+            "operation": operation,
+            "image_index": image_index,
+            "layer_name": layer_name,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"select_contiguous failed: {e}")
+
+
+@mcp.tool()
+def channel_to_selection(
+    ctx: Context,
+    channel_name: str,
+    operation: str = "replace",
+    image_index: int = 0
+) -> dict:
+    """Restore a saved channel as the active selection.
+
+    Pairs with selection_to_channel: load a previously saved channel
+    (by name) back into the selection. Component channels (Red/Green/Blue)
+    are not returned by the channel list; only user/saved channels apply.
+
+    Parameters:
+    - channel_name: Name of the saved channel to load (exact match, case-sensitive)
+    - operation: How to combine with the current selection -
+      "replace" (default), "add", "subtract", "intersect"
+    - image_index: Target image index (default 0)
+
+    Returns status dict.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("channel_to_selection", {
+            "channel_name": channel_name,
+            "operation": operation,
+            "image_index": image_index,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"channel_to_selection failed: {e}")
+
+
+@mcp.tool()
 def select_all(ctx: Context, image_index: int = 0) -> dict:
     """Select the entire image canvas.
 
@@ -1474,6 +1662,78 @@ def modify_selection(
     except Exception as e:
         traceback.print_exc()
         raise Exception(f"modify_selection failed: {e}")
+
+
+@mcp.tool()
+def alpha_to_selection(
+    ctx: Context,
+    layer_name: str | None = None,
+    layer_index: int | None = None,
+    operation: str = "replace",
+    image_index: int = 0
+) -> dict:
+    """Set the selection from a layer's alpha channel (its non-transparent content).
+
+    Loads the chosen layer's opaque region as a selection. On a layer with partial
+    transparency the selection bounds match the opaque pixels; on a fully opaque
+    layer the selection is the whole layer bounds (expected).
+
+    Parameters:
+    - layer_name: Layer to read alpha from by name; takes priority over layer_index
+    - layer_index: Layer to read alpha from by stack index; used if layer_name is None
+    - operation: How to combine with the current selection — one of
+      "replace" (default), "add", "subtract", "intersect"
+    - image_index: Target image index (default 0)
+
+    If neither layer_name nor layer_index is given, the active layer is used.
+
+    Returns status dict.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("alpha_to_selection", {
+            "layer_name": layer_name,
+            "layer_index": layer_index,
+            "operation": operation,
+            "image_index": image_index,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"alpha_to_selection failed: {e}")
+
+
+@mcp.tool()
+def selection_to_channel(
+    ctx: Context,
+    name: str,
+    image_index: int = 0
+) -> dict:
+    """Save the current selection as a new named channel (saved selection).
+
+    The active selection is copied into a new channel inserted into the image,
+    which can later be restored. Fails loud if the selection is empty.
+
+    Parameters:
+    - name: Channel name to assign to the saved selection
+    - image_index: Target image index (default 0)
+
+    Returns: {channel_name, channel_id}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("selection_to_channel", {
+            "name": name,
+            "image_index": image_index,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"selection_to_channel failed: {e}")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1799,6 +2059,48 @@ def merge_visible_layers(ctx: Context, image_index: int = 0) -> dict:
     except Exception as e:
         traceback.print_exc()
         raise Exception(f"merge_visible_layers failed: {e}")
+
+
+@mcp.tool()
+def merge_down(
+    ctx: Context,
+    layer_name: str | None = None,
+    layer_index: int | None = None,
+    merge_type: str = "expand",
+    image_index: int = 0,
+) -> dict:
+    """Merge a layer down into the single layer directly below it.
+
+    Unlike merge_visible_layers (which flattens ALL visible layers), this merges
+    only the identified UPPER layer into the one immediately beneath it.
+
+    Parameters:
+    - layer_name: Name of the UPPER layer to merge down (optional)
+    - layer_index: Index of the UPPER layer to merge down (optional;
+      name takes precedence, else falls back to the active layer)
+    - merge_type: How the result is clipped — one of:
+        "expand"      -> EXPAND_AS_NECESSARY (default; result grows to fit both)
+        "clip_image"  -> CLIP_TO_IMAGE
+        "clip_bottom" -> CLIP_TO_BOTTOM_LAYER
+    - image_index: Target image index (default 0)
+
+    Returns: {layer_name, layer_id} of the resulting merged layer.
+    Errors if the target is already the bottom-most layer (nothing below).
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("merge_down", {
+            "layer_name": layer_name,
+            "layer_index": layer_index,
+            "merge_type": merge_type,
+            "image_index": image_index,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"merge_down failed: {e}")
 
 
 @mcp.tool()
