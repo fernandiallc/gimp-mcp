@@ -84,18 +84,25 @@ class GimpConnection:
         logger.info(f"[{req_id}] -> {command_type}")
         try:
             self.sock.sendall(json.dumps(command).encode('utf-8') + b'\n')
-            response_data = b''
+            # NDJSON framing: read until the '\n' terminator OR EOF (peer close).
+            # O(1) terminator check per chunk (endswith tests one byte) — never
+            # json.loads the growing buffer, which was O(n^2) on multi-MB base64
+            # bitmaps. Back-compat: an OLD plugin that sends no trailing '\n' still
+            # completes here on EOF (auto_disconnect closes the socket after replying).
+            # NDJSON framing is wire-compatible with the old parse-until-valid framing
+            # in the one-shot connection model (new<->old interoperate via the
+            # '\n'-or-EOF read), so PROTOCOL_VERSION is intentionally NOT bumped —
+            # bumping would emit spurious check_server() mismatch warnings during a
+            # half-updated deploy.
+            response_data = bytearray()   # O(n) accumulation (bytes += would be O(n^2) memcpy)
             while True:
-                chunk = self.sock.recv(8192)
+                chunk = self.sock.recv(65536)
                 if not chunk:
                     break
-                response_data += chunk
-                try:
-                    json.loads(response_data.decode('utf-8'))
+                response_data.extend(chunk)
+                if response_data.endswith(b'\n'):
                     break
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-            result = json.loads(response_data.decode('utf-8'))
+            result = json.loads(response_data.rstrip(b'\n').decode('utf-8'))
             if isinstance(result, dict) and result.get("status") != "success":
                 # Capture the plugin-provided traceback here — tool wrappers raise only the
                 # short error string, so without this the stack trace is lost.
