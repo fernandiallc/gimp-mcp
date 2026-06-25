@@ -16,6 +16,11 @@ logger = logging.getLogger("GimpMCPServer")
 
 GIMP_HOST = 'localhost'
 GIMP_PORT = 9877
+GIMP_CONNECT_TIMEOUT = 10   # seconds — fail fast if the GIMP plugin isn't listening
+# Heavy GIMP ops (scale/flatten/export of large multi-layer images) legitimately take
+# tens of seconds; a flat 10s timeout aborted them mid-flight and a crash followed on the
+# next call. Widen the timeout for recv once connected.
+GIMP_OP_TIMEOUT = 300       # seconds
 
 class GimpConnection:
     def __init__(self, host=GIMP_HOST, port=GIMP_PORT):
@@ -28,8 +33,11 @@ class GimpConnection:
             return
         try:
             self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.settimeout(10)
+            self.sock.settimeout(GIMP_CONNECT_TIMEOUT)
             self.sock.connect((self.host, self.port))
+            # Once connected, allow long-running ops to complete instead of aborting recv
+            # at the (short) connect timeout.
+            self.sock.settimeout(GIMP_OP_TIMEOUT)
             logger.info(f"Connected to GIMP at {self.host}:{self.port}")
         except Exception as e:
             self.sock = None
@@ -85,7 +93,31 @@ def reset_gimp_connection():
     _gimp_connection = None
 
 # MCP server
-mcp = FastMCP("GimpMCP", description="GIMP integration through MCP — with new_canvas, check_server, restart_server")
+mcp = FastMCP(
+    "GimpMCP",
+    instructions=(
+        "Drive a LIVE GIMP 3.2 session to create and edit raster images: photo "
+        "retouching, color/levels/curves, layers + masks, text, shapes, filters "
+        "(blur, sharpen, drop-shadow, vignette), crop/scale/rotate, and export "
+        "(PNG/JPEG/WebP, icon sizes, social-media kits, sprite sheets). Search "
+        "these tools whenever the user wants to edit, generate, convert, retouch, "
+        "or export an image and a GIMP-style result is acceptable.\n"
+        "WORKFLOW (always): 1) call check_server FIRST; if not connected, tell the "
+        "user to run GIMP > Tools > MCP > Start MCP Server, then stop. 2) open_image "
+        "or new_canvas. 3) make ONE change, then call get_state_snapshot to SEE the "
+        "result, then verify with get_pixel_color / get_histogram / get_context_state "
+        "before the next change -- self-correct from pixels, never assume. Validate "
+        "every 3-5 ops. 4) export_image when done.\n"
+        "RULES: prefer the ~79 named structured tools; use call_api ONLY for ops no "
+        "named tool covers, and check its returned string for a leading 'Error:'. "
+        "For an expression VALUE via call_api use keyword 'python-fu-eval' (NOT "
+        "'pyGObject-eval'). Issue GIMP calls strictly ONE AT A TIME -- never "
+        "parallelize. Keep snapshots small (max_width~1024) to save tokens. Pass an "
+        "EXACT font name from list_fonts. For multi-element compositions invoke the "
+        "/mcp__gimp-mcp__gimp_iterative_workflow prompt; for low-level pitfalls "
+        "invoke /mcp__gimp-mcp__gimp_best_practices."
+    ),
+)
 
 @mcp.tool()
 def check_server(ctx: Context) -> dict:
@@ -213,7 +245,7 @@ def get_image_bitmap(ctx: Context, max_width: int | None = None, max_height: int
     """
     try:
 
-        print("Requesting current image bitmap from GIMP...")
+        logger.info("Requesting current image bitmap from GIMP...")
 
         conn = get_gimp_connection()
         
@@ -262,7 +294,7 @@ def get_image_metadata(ctx: Context) -> dict:
     - Raises exception if no images are open
     """
     try:
-        print("Requesting current image metadata from GIMP...")
+        logger.info("Requesting current image metadata from GIMP...")
         
         conn = get_gimp_connection()
         result = conn.send_command("get_image_metadata")
@@ -295,7 +327,7 @@ def get_gimp_info(ctx: Context) -> dict:
     - Raises exception if GIMP connection fails
     """
     try:
-        print("Requesting GIMP environment information...")
+        logger.info("Requesting GIMP environment information...")
 
         conn = get_gimp_connection()
         result = conn.send_command("get_gimp_info")
@@ -340,7 +372,7 @@ def get_state_snapshot(
     """
     try:
         if label:
-            print(f"[snapshot] {label}")
+            logger.info(f"[snapshot] {label}")
         conn = get_gimp_connection()
         params: dict = {"image_index": image_index}
         if max_size:

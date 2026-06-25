@@ -29,6 +29,11 @@ import signal
 LARGE_SCALING_THRESHOLD = 4.0  # Warn if scaling ratio exceeds this value
 MAX_REGION_SIZE = 8192  # Maximum region dimension in pixels
 DEFAULT_TIMEOUT_SECONDS = 30  # Default timeout for operations
+# Safety net for marshaling GIMP work onto the main thread. Generous because a
+# single heavy op (scale/flatten/export of a large multi-layer image) can run for
+# tens of seconds; if it ever exceeds this the worker returns an error dict instead
+# of blocking forever. This is a last-resort guard, not the normal completion path.
+MAIN_THREAD_CALL_TIMEOUT_SECONDS = 300
 
 
 def N_(message): return message
@@ -56,6 +61,11 @@ class MCPPlugin(Gimp.PlugIn):
         self.context = {}
         exec("from gi.repository import Gimp", self.context)
         self.auto_disconnect_client = True
+        # GIMP 3.2 libgimp exposes no way to find an image's display(s) from the image
+        # (no Gimp.get_displays, and Gimp.Display has no get_image), and image.delete()
+        # is a no-op while a display is open. So we record the display we create for each
+        # image here (image_id -> Gimp.Display) and use it to close the image later.
+        self._displays_by_image_id = {}
 
     def do_set_i18n(self, procname):
         # Plugin has no translations; tell GIMP so it stops logging
@@ -187,6 +197,47 @@ class MCPPlugin(Gimp.PlugIn):
 
         return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())
 
+    def _run_on_main_thread(self, fn, *args, **kwargs):
+        """Run fn on the GIMP main thread and block the calling (worker) thread until it returns.
+
+        libgimp/PDB is not thread-safe: all Gimp.* calls must happen on the thread that
+        owns the GLib main loop (started in run()). Client connections are handled on worker
+        threads, so any GIMP-touching work is marshalled here via GLib.idle_add and the worker
+        blocks on an Event until the main loop has produced a result. Socket I/O stays on the
+        worker. Exceptions are captured and returned as an error dict — never allowed to escape
+        and crash the plugin.
+        """
+        done = threading.Event()
+        box = {}
+
+        def _cb():
+            try:
+                box["result"] = fn(*args, **kwargs)
+            except Exception as e:
+                box["error"] = e
+                box["tb"] = traceback.format_exc()
+            finally:
+                done.set()
+            return GLib.SOURCE_REMOVE  # one-shot idle source
+
+        GLib.idle_add(_cb)
+
+        if not done.wait(timeout=MAIN_THREAD_CALL_TIMEOUT_SECONDS):
+            # The idle callback never completed in time — either the main loop isn't
+            # dispatching idle sources or the op is genuinely stuck. Fail loud, don't hang.
+            msg = (f"GIMP operation did not complete within "
+                   f"{MAIN_THREAD_CALL_TIMEOUT_SECONDS}s on the main thread")
+            print(f"[MCP] {msg}: {getattr(fn, '__name__', fn)}", file=sys.stderr)
+            return {"status": "error", "error": msg}
+
+        if "error" in box:
+            return {
+                "status": "error",
+                "error": str(box["error"]),
+                "traceback": box.get("tb"),
+            }
+        return box["result"]
+
     def _handle_client(self, client):
         """Handle connected client"""
         # print("Client handler started")
@@ -226,7 +277,9 @@ class MCPPlugin(Gimp.PlugIn):
             request = str(buffer)
         
         # print(f"Parsed request: {request}")
-        response = self.execute_command(request)
+        # GIMP/PDB calls are not thread-safe — run the command on the main thread
+        # (where the GLib main loop lives), not on this worker thread.
+        response = self._run_on_main_thread(self.execute_command, request)
         print(f"response type: {type(response)}")
         
         if isinstance(response, dict):
@@ -511,16 +564,18 @@ class MCPPlugin(Gimp.PlugIn):
             scaled_to_width = region.get("max_width")  # Region scaling uses max_width/max_height
             scaled_to_height = region.get("max_height")
 
-            # Get the current images
-            images = Gimp.get_images()
-            if not images:
-                return {
-                    "status": "error",
-                    "error": "No images are currently open in GIMP"
-                }
-            
-            # Use the first image (most recently active)
-            original_image = images[0]
+            # Resolve the target image by index through the shared canonical resolver
+            # (honors params["image_index"], defaults to 0). Previously this always used
+            # Gimp.get_images()[0] and ignored image_index, so snapshots of a non-front
+            # image (e.g. via get_state_snapshot) silently returned the wrong image.
+            try:
+                image_index = int(params.get("image_index", 0))
+            except (TypeError, ValueError):
+                image_index = 0
+            try:
+                original_image = self._get_image(image_index)
+            except RuntimeError as e:
+                return {"status": "error", "error": str(e)}
             
             # Get original image dimensions
             orig_img_width = original_image.get_width()
@@ -1470,7 +1525,7 @@ class MCPPlugin(Gimp.PlugIn):
                 Gimp.context_set_background(bg_color)
                 Gimp.Drawable.edit_fill(layer, Gimp.FillType.BACKGROUND)
 
-            Gimp.Display.new(image)
+            self._displays_by_image_id[image.get_id()] = Gimp.Display.new(image)
             Gimp.displays_flush()
 
             print(f"New canvas created: {width}x{height} {color_mode} fill={fill}")
@@ -1498,9 +1553,20 @@ class MCPPlugin(Gimp.PlugIn):
     # SHARED HELPERS
     # =========================================================================
 
+    def _all_images(self):
+        """Return all open images in a STABLE canonical order (sorted by image id).
+
+        Gimp.get_images() does not guarantee a consistent order across calls, so a bare
+        index could resolve to different images at different times. Sorting by the
+        immutable image id gives every tool one shared ordering: list_images index N and
+        any tool's image_index=N always refer to the same image. Index 0 = lowest id =
+        earliest-opened image.
+        """
+        return sorted(Gimp.get_images(), key=lambda im: im.get_id())
+
     def _get_image(self, image_index):
-        """Return the image at image_index from Gimp.get_images(), raise if none open."""
-        images = Gimp.get_images()
+        """Return the image at image_index in canonical order, raise if none open."""
+        images = self._all_images()
         if not images:
             raise RuntimeError("No images are currently open in GIMP")
         if image_index >= len(images):
@@ -1659,6 +1725,7 @@ class MCPPlugin(Gimp.PlugIn):
             if image is None:
                 return {"status": "error", "error": f"Could not open file: {file_path}"}
             display = Gimp.Display.new(image)
+            self._displays_by_image_id[image.get_id()] = display
             Gimp.displays_flush()
             base_type = image.get_base_type()
             mode_map = {
@@ -3764,7 +3831,7 @@ class MCPPlugin(Gimp.PlugIn):
     def _list_images(self, params):
         """List all open images."""
         try:
-            images = Gimp.get_images()
+            images = self._all_images()
             image_list = []
             base_type_map = {
                 Gimp.ImageBaseType.RGB:     "RGB",
@@ -3793,21 +3860,32 @@ class MCPPlugin(Gimp.PlugIn):
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
     def _set_active_image(self, params):
-        """Raise a specific image to the front."""
+        """Raise a specific image's display to the front (best-effort)."""
         try:
             image_index = int(params.get("image_index", 0))
             image = self._get_image(image_index)
-            displays = Gimp.get_displays()
-            for display in displays:
+            presented = False
+            # GIMP 3.2 removed display enumeration from libgimp (neither Gimp.get_displays
+            # nor Gimp.display_list exists), which is what crashed this handler. Probe both
+            # defensively for forward/backward compatibility; if neither is present we can
+            # still flush but cannot programmatically raise a specific window.
+            gd = getattr(Gimp, "get_displays", None) or getattr(Gimp, "display_list", None)
+            if gd is not None:
                 try:
-                    if display.get_image().get_id() == image.get_id():
-                        Gimp.set_default_context()
-                        display.present()
-                        break
+                    for display in gd():
+                        try:
+                            if display.get_image().get_id() == image.get_id():
+                                display.present()
+                                presented = True
+                                break
+                        except Exception:
+                            pass
                 except Exception:
                     pass
             Gimp.displays_flush()
-            return {"status": "success", "results": {"status": "success", "image_id": image.get_id()}}
+            return {"status": "success",
+                    "results": {"status": "success", "image_id": image.get_id(),
+                                "presented": presented}}
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
@@ -3904,14 +3982,45 @@ class MCPPlugin(Gimp.PlugIn):
                     cfg.set_property("image", image)
                     cfg.set_property("file", gio_file)
                     proc.run(cfg)
-            # Delete all displays for this image
-            for display in Gimp.get_displays():
+            # GIMP 3.2 libgimp can't find an image's displays from the image, and
+            # image.delete() silently no-ops while a display is open. Delete the display we
+            # recorded when this image was opened/created, then delete the image. Probe the
+            # (normally absent) enumeration API too, for images opened outside this plugin.
+            image_id = image.get_id()
+            display = self._displays_by_image_id.pop(image_id, None)
+            if display is not None:
                 try:
-                    if display.get_image().get_id() == image.get_id():
+                    if display.is_valid():
                         Gimp.Display.delete(display)
                 except Exception:
                     pass
-            image.delete()
+            gd = getattr(Gimp, "get_displays", None) or getattr(Gimp, "display_list", None)
+            if gd is not None:
+                try:
+                    for d in gd():
+                        try:
+                            if d.get_image().get_id() == image_id:
+                                Gimp.Display.delete(d)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            Gimp.displays_flush()
+            # Deleting an image's last display also frees the image in GIMP. Only call
+            # image.delete() if the image still exists — otherwise gimp-image-delete raises
+            # a PDB "invalid ID" calling error on the already-freed image.
+            still_open = any(im.get_id() == image_id for im in Gimp.get_images())
+            if still_open:
+                image.delete()
+                still_open = any(im.get_id() == image_id for im in Gimp.get_images())
+            # Fail loud: image.delete() no-ops while a display we couldn't reach is open.
+            if still_open:
+                return {
+                    "status": "error",
+                    "error": ("Image could not be closed — a display window is still open "
+                              "and GIMP 3.2 cannot locate displays opened outside this plugin "
+                              "(e.g. via the GIMP UI). Close the window in GIMP and retry."),
+                }
             return {"status": "success", "results": {"status": "success"}}
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
@@ -3991,22 +4100,39 @@ class MCPPlugin(Gimp.PlugIn):
                 cfg.set_property("start-range", 0.0)
                 cfg.set_property("end-range",   1.0)
                 result = proc.run(cfg)
-                # Return values: mean, std-dev, median, pixels, count, percentile
+                # proc.run() returns a Gimp.ValueArray whose index 0 is the PDB status;
+                # the real outputs (mean, std-dev, median, pixels, count, percentile)
+                # start at index 1. Reading from index 0 shifted every field by one
+                # (status leaked into "mean", real mean into "std_dev", etc.).
                 def _safe(idx):
                     try:
                         return result.index(idx)
                     except Exception:
                         return 0
-                return {
-                    "status": "success",
-                    "results": {
-                        "mean":    _safe(0),
-                        "std_dev": _safe(1),
-                        "median":  _safe(2),
-                        "pixels":  _safe(3),
-                        "count":   _safe(4),
-                    }
+                mean    = _safe(1)
+                std_dev = _safe(2)
+                median  = _safe(3)
+                pixels  = _safe(4)
+                count   = _safe(5)
+                results = {
+                    "mean":    mean,
+                    "std_dev": std_dev,
+                    "median":  median,
+                    "pixels":  pixels,
+                    "count":   count,
                 }
+                # Sanity guard: std_dev cannot exceed ~127.5 on an 8-bit (0-255) channel.
+                # A larger value means the field mapping or value scale is wrong — surface
+                # it loudly instead of returning silently-bogus statistics.
+                try:
+                    if std_dev is not None and float(std_dev) > 128.0:
+                        warn = (f"std_dev {std_dev} exceeds 128 (impossible on an 8-bit "
+                                f"channel) — histogram field mapping or scale may be wrong")
+                        print(f"[MCP] {warn}", file=sys.stderr)
+                        results["warning"] = warn
+                except (TypeError, ValueError):
+                    pass
+                return {"status": "success", "results": results}
             else:
                 return {"status": "error", "error": "gimp-drawable-histogram not available"}
         except Exception as e:

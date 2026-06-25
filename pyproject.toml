@@ -11,8 +11,10 @@ license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.11"
 dependencies = [
-    "mcp",
-    "fastmcp",
+    # Pinned <2: mcp v2 renames FastMCP -> MCPServer and moves the module, which would
+    # break `from mcp.server.fastmcp import FastMCP` in gimp_mcp_server.py with no code
+    # change. The standalone `fastmcp` package was listed but never imported — dropped.
+    "mcp>=1.12,<2",
 ]
 
 [project.scripts]
