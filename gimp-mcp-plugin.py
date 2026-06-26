@@ -700,15 +700,12 @@ class MCPPlugin(Gimp.PlugIn):
                 # Create a new layer in working image
                 # In GIMP 3.0+, use the image's base type instead of layer.get_image_type()
                 try:
-                    # Try to get layer type - fallback to image base type
-                    if hasattr(orig_layers[0], 'get_type'):
-                        layer_type = orig_layers[0].get_type()
-                    else:
-                        # Use image base type as fallback
-                        layer_type = original_image.get_base_type()
-                except AttributeError:
-                    # Final fallback - use RGB
-                    layer_type = Gimp.ImageBaseType.RGB
+                    # drawable.type() yields a Gimp.ImageType (what Layer.new wants).
+                    # NOT get_type(), which is the GObject class GType.
+                    layer_type = orig_layers[0].type()
+                except (AttributeError, GLib.Error):
+                    # Fallback: RGBA layer (safe default for most images)
+                    layer_type = Gimp.ImageType.RGBA_IMAGE
                 
                 new_layer = Gimp.Layer.new(working_image, 'Region', region_width, region_height, 
                                          layer_type, 100, Gimp.LayerMode.NORMAL)
@@ -1103,7 +1100,7 @@ class MCPPlugin(Gimp.PlugIn):
                         "width": layer.get_width(),
                         "height": layer.get_height(),
                         "has_alpha": layer.has_alpha(),
-                        "is_group": hasattr(layer, 'get_children') and callable(getattr(layer, 'get_children')),
+                        "is_group": layer.is_group(),
                         "layer_type": self._get_layer_type_string(layer)
                     }
                     # Try to get layer mode if available
@@ -1257,21 +1254,24 @@ class MCPPlugin(Gimp.PlugIn):
             return str(precision)
             
     def _get_layer_type_string(self, layer):
-        """Get layer type string with compatibility for different GIMP versions."""
+        """Return the layer's pixel image type ("RGBA", "GRAY", ...).
+
+        Uses Gimp.Drawable.type() (gimp_drawable_type). NOT layer.get_type():
+        every GObject inherits get_type(), which returns the class GType
+        (e.g. "<GType GimpLayer>") — not the pixel type — which is why this
+        field previously rendered a bound-method-style repr.
+        """
+        type_names = {
+            Gimp.ImageType.RGB_IMAGE:      "RGB",
+            Gimp.ImageType.RGBA_IMAGE:     "RGBA",
+            Gimp.ImageType.GRAY_IMAGE:     "GRAY",
+            Gimp.ImageType.GRAYA_IMAGE:    "GRAYA",
+            Gimp.ImageType.INDEXED_IMAGE:  "INDEXED",
+            Gimp.ImageType.INDEXEDA_IMAGE: "INDEXEDA",
+        }
         try:
-            # Try different methods to get layer type
-            if hasattr(layer, 'get_type'):
-                return str(layer.get_type())
-            elif hasattr(layer, 'get_image_type'):
-                return str(layer.get_image_type())
-            elif hasattr(layer, 'type'):
-                return str(layer.type)
-            else:
-                # Fallback - determine from layer properties
-                if layer.has_alpha():
-                    return "RGBA"
-                else:
-                    return "RGB"
+            t = layer.type()
+            return type_names.get(t, str(t))
         except Exception as e:
             print(f"Warning: Could not determine layer type: {e}")
             return "unknown"
