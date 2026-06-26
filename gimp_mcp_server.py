@@ -941,6 +941,56 @@ def adjust_curves(
 
 
 @mcp.tool()
+def adjust_levels(
+    ctx: Context,
+    low_input: float = 0,
+    high_input: float = 255,
+    gamma: float = 1.0,
+    low_output: float = 0,
+    high_output: float = 255,
+    channel: str = "value",
+    image_index: int = 0,
+    layer_name: str | None = None
+) -> dict:
+    """Set precise black/white/gamma points on a layer (Levels adjustment).
+
+    Unlike auto_levels (which auto-stretches) this gives explicit control of the
+    input black/white points, midtone gamma, and output range — the standard way
+    to fix exposure/contrast or remap tonal range.
+
+    Parameters (input/output points are on a 0-255 scale):
+    - low_input: input black point; pixels at/below map to low_output (default 0)
+    - high_input: input white point; pixels at/above map to high_output (default 255)
+    - gamma: midtone multiplier, 1.0 = neutral, >1 brightens mids, <1 darkens (default 1.0)
+    - low_output: output black point (default 0)
+    - high_output: output white point (default 255)
+    - channel: "value" (all), "red", "green", "blue", "alpha"
+    - image_index: target image index (default 0)
+    - layer_name: layer to adjust; defaults to active layer
+
+    Returns status dict echoing the applied points.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("adjust_levels", {
+            "low_input": low_input,
+            "high_input": high_input,
+            "gamma": gamma,
+            "low_output": low_output,
+            "high_output": high_output,
+            "channel": channel,
+            "image_index": image_index,
+            "layer_name": layer_name,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"adjust_levels failed: {e}")
+
+
+@mcp.tool()
 def adjust_brightness_contrast(
     ctx: Context,
     brightness: int = 0,
@@ -2228,6 +2278,32 @@ def merge_down(
 
 
 @mcp.tool()
+def layer_from_visible(ctx: Context, name: str = "Visible", image_index: int = 0) -> dict:
+    """Stamp a merged copy of all visible layers as a new layer on top.
+
+    Non-destructive alternative to flatten_image / merge_visible_layers: the
+    source layers are left intact and a new composited layer is added at the top
+    of the stack. Useful to snapshot the current look before further edits, or to
+    apply a filter to the combined result without merging the originals.
+
+    Parameters:
+    - name: name for the new layer (default "Visible")
+    - image_index: target image index (default 0)
+
+    Returns: {layer_name, layer_id}
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("layer_from_visible", {"name": name, "image_index": image_index})
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"layer_from_visible failed: {e}")
+
+
+@mcp.tool()
 def list_layers(ctx: Context, image_index: int = 0) -> dict:
     """List all layers in an image with their properties.
 
@@ -2310,6 +2386,48 @@ def fill_selection(
     except Exception as e:
         traceback.print_exc()
         raise Exception(f"fill_selection failed: {e}")
+
+
+@mcp.tool()
+def bucket_fill(
+    ctx: Context,
+    x: int,
+    y: int,
+    color: str | None = None,
+    threshold: int = 15,
+    opacity: float | None = None,
+    image_index: int = 0,
+    layer_name: str | None = None
+) -> dict:
+    """Flood-fill the contiguous region of similar pixels around a seed point.
+
+    The paint-bucket tool: starting at (x, y) it fills outward over pixels whose
+    color is within `threshold` of the seed. Distinct from fill_selection (fills
+    the active selection) and fill_layer (fills everything) — use this to recolor
+    a contiguous area like a background patch without selecting it first.
+
+    Parameters:
+    - x, y: seed point in layer pixel coordinates (required; must be inside the layer)
+    - color: fill color (CSS name / hex / rgb()); defaults to the current foreground
+    - threshold: color-similarity tolerance 0-255 (default 15; higher = fills more)
+    - opacity: fill opacity 0-100 (default: current context opacity)
+    - image_index: target image index (default 0)
+    - layer_name: target layer; defaults to active layer
+
+    Returns status dict echoing the seed point.
+    """
+    try:
+        conn = get_gimp_connection()
+        result = conn.send_command("bucket_fill", {
+            "x": x, "y": y, "color": color, "threshold": threshold,
+            "opacity": opacity, "image_index": image_index, "layer_name": layer_name,
+        })
+        if result["status"] == "success":
+            return result["results"]
+        raise Exception(result.get("error", "Unknown error"))
+    except Exception as e:
+        traceback.print_exc()
+        raise Exception(f"bucket_fill failed: {e}")
 
 
 @mcp.tool()
