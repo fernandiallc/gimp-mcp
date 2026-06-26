@@ -39,6 +39,16 @@ MAIN_THREAD_CALL_TIMEOUT_SECONDS = 300
 # MUST stay numerically identical to PROTOCOL_VERSION in gimp_mcp_server.py.
 PROTOCOL_VERSION = 1
 
+# Raw-code execution gate. Anything that can open TCP 9877 can otherwise run
+# arbitrary Python in GIMP's process via the call_api / cmds / args exec+eval
+# paths (same posture as GIMP's Script-Fu Server). Default OFF: only the named
+# structured tools (image edits) are reachable. Set GIMP_MCP_ALLOW_EXEC=1 (in
+# GIMP's environment, before launch) to re-enable call_api / pyGObject exec.
+# Read once at plugin load — toggling it requires a GIMP restart, which is also
+# how the plugin reloads, so there is no stale-flag window.
+EXEC_ENABLED = os.environ.get("GIMP_MCP_ALLOW_EXEC", "").strip().lower() in (
+    "1", "true", "yes", "on")
+
 
 def N_(message): return message
 def _(message): return GLib.dgettext(None, message)
@@ -340,6 +350,17 @@ class MCPPlugin(Gimp.PlugIn):
             client.close()
         return
 
+    def _exec_disabled_error(self):
+        """Fail-loud envelope for the raw-exec gate (GIMP_MCP_ALLOW_EXEC off)."""
+        return {
+            "status": "error",
+            "error": ("Raw code execution (call_api / cmds / args) is disabled on "
+                      "this GIMP instance. The ~90 named structured tools still work. "
+                      "To re-enable, set GIMP_MCP_ALLOW_EXEC=1 in GIMP's environment "
+                      "and restart GIMP."),
+            "exec_enabled": False,
+        }
+
     def execute_command(self, request):
         """Execute commands in GIMP's main thread."""
         try:
@@ -357,7 +378,7 @@ class MCPPlugin(Gimp.PlugIn):
             elif "type" in j and j["type"] == "get_context_state":
                 return self._get_context_state()
             elif "type" in j and j["type"] == "check_server":
-                return {"status": "success", "results": {"running": True, "port": self.port, "protocol_version": PROTOCOL_VERSION}}
+                return {"status": "success", "results": {"running": True, "port": self.port, "protocol_version": PROTOCOL_VERSION, "exec_enabled": EXEC_ENABLED}}
             elif "type" in j and j["type"] == "restart_server":
                 return self._restart_server()
             elif "type" in j and j["type"] == "new_canvas":
@@ -536,8 +557,12 @@ class MCPPlugin(Gimp.PlugIn):
             elif "type" in j and j["type"] == "warp_region":
                 return self._warp_region(j.get("params", {}))
             elif "cmds" in j:
+                if not EXEC_ENABLED:
+                    return self._exec_disabled_error()
                 a = ['python-fu-exec', j["cmds"]]
             else:
+                if not EXEC_ENABLED:
+                    return self._exec_disabled_error()
                 p = j["params"]
                 a = p['args']
 
@@ -1540,6 +1565,7 @@ class MCPPlugin(Gimp.PlugIn):
                 gimp_info["system"] = {"error": str(sys_error)}
 
             gimp_info["protocol_version"] = PROTOCOL_VERSION
+            gimp_info["exec_enabled"] = EXEC_ENABLED
             return {
                 "status": "success",
                 "results": gimp_info
