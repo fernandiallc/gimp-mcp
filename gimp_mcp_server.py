@@ -174,6 +174,8 @@ def check_server(ctx: Context) -> dict:
     - gimp_version: if connected successfully
     - protocol_version: plugin-reported wire version (None if the plugin predates the handshake)
     - protocol_warning: present only on version drift; non-fatal
+    - exec_enabled: whether raw call_api/cmds code execution is allowed on the plugin
+      (default False; set GIMP_MCP_ALLOW_EXEC=1 in GIMP's environment to enable)
     - error: description if not connected
 
     Use this before any other operation to verify the GIMP plugin is running.
@@ -192,6 +194,7 @@ def check_server(ctx: Context) -> dict:
             "port": GIMP_PORT,
             "gimp_version": version,
             "protocol_version": plugin_protocol,
+            "exec_enabled": results.get("exec_enabled"),   # None for pre-gate plugins
         }
         if plugin_protocol != PROTOCOL_VERSION:
             out["protocol_warning"] = (
@@ -574,6 +577,11 @@ def get_context_state(ctx: Context) -> dict:
 @mcp.tool()
 def call_api(ctx: Context, api_path: str, args: list | None = None, kwargs: dict | None = None) -> str:
     """Call GIMP 3.2 API methods through PyGObject console.
+
+    SECURITY GATE: raw code execution is OFF by default. If check_server reports
+    exec_enabled=False this tool raises "Raw code execution ... is disabled" and
+    you must use the named structured tools instead (or ask the user to set
+    GIMP_MCP_ALLOW_EXEC=1 in GIMP's environment and restart GIMP).
 
     GIMP MCP Protocol:
     - Use api_path="exec" to execute Python code in GIMP
