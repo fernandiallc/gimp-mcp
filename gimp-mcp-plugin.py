@@ -402,6 +402,8 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._auto_levels(j.get("params", {}))
             elif "type" in j and j["type"] == "adjust_curves":
                 return self._adjust_curves(j.get("params", {}))
+            elif "type" in j and j["type"] == "adjust_levels":
+                return self._adjust_levels(j.get("params", {}))
             elif "type" in j and j["type"] == "adjust_brightness_contrast":
                 return self._adjust_brightness_contrast(j.get("params", {}))
             elif "type" in j and j["type"] == "adjust_hue_saturation":
@@ -477,6 +479,8 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._merge_visible_layers(j.get("params", {}))
             elif "type" in j and j["type"] == "merge_down":
                 return self._merge_down(j.get("params", {}))
+            elif "type" in j and j["type"] == "layer_from_visible":
+                return self._layer_from_visible(j.get("params", {}))
             elif "type" in j and j["type"] == "list_layers":
                 return self._list_layers(j.get("params", {}))
             elif "type" in j and j["type"] == "add_layer_mask":
@@ -488,6 +492,8 @@ class MCPPlugin(Gimp.PlugIn):
                 return self._fill_layer(j.get("params", {}))
             elif "type" in j and j["type"] == "fill_selection":
                 return self._fill_selection(j.get("params", {}))
+            elif "type" in j and j["type"] == "bucket_fill":
+                return self._bucket_fill(j.get("params", {}))
             elif "type" in j and j["type"] == "set_colors":
                 return self._set_colors(j.get("params", {}))
             elif "type" in j and j["type"] == "draw_line":
@@ -2140,6 +2146,72 @@ class MCPPlugin(Gimp.PlugIn):
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
+    def _adjust_levels(self, params):
+        """Set black/white/gamma points via gimp-drawable-levels.
+
+        Inputs are 0-255 (low_input/high_input/low_output/high_output) to match
+        the adjust_curves convention; gamma is a multiplier (1.0 = neutral).
+        Normalized to the PDB's 0.0-1.0 range. gimp-drawable-levels is the same
+        proc _auto_levels falls back to, so it is known-present on this 3.2 build.
+        """
+        try:
+            CHANNEL_MAP = {
+                "value": Gimp.HistogramChannel.VALUE,
+                "red":   Gimp.HistogramChannel.RED,
+                "green": Gimp.HistogramChannel.GREEN,
+                "blue":  Gimp.HistogramChannel.BLUE,
+                "alpha": Gimp.HistogramChannel.ALPHA,
+            }
+            image_index = int(params.get("image_index", 0))
+            layer_name  = params.get("layer_name", None)
+            channel_str = (params.get("channel") or "value").lower()
+            low_input   = float(params.get("low_input", 0))
+            high_input  = float(params.get("high_input", 255))
+            gamma       = float(params.get("gamma", 1.0))
+            low_output  = float(params.get("low_output", 0))
+            high_output = float(params.get("high_output", 255))
+
+            if channel_str not in CHANNEL_MAP:
+                return {"status": "error",
+                        "error": f"Unknown channel '{channel_str}'. Use: {', '.join(CHANNEL_MAP)}"}
+            if high_input <= low_input:
+                return {"status": "error",
+                        "error": "high_input must be greater than low_input (0-255 scale)"}
+            if gamma <= 0:
+                return {"status": "error", "error": "gamma must be > 0"}
+
+            image    = self._get_image(image_index)
+            drawable = self._resolve_layer(image, layer_name, None)
+            channel  = CHANNEL_MAP[channel_str]
+
+            pdb = Gimp.get_pdb()
+            proc = pdb.lookup_procedure("gimp-drawable-levels")
+            if not proc:
+                return {"status": "error",
+                        "error": "gimp-drawable-levels procedure not available on this GIMP build"}
+
+            image.undo_group_start()
+            try:
+                cfg = proc.create_config()
+                cfg.set_property("drawable",    drawable)
+                cfg.set_property("channel",     channel)
+                cfg.set_property("low-input",   low_input / 255.0)
+                cfg.set_property("high-input",  high_input / 255.0)
+                cfg.set_property("clamp-input", True)
+                cfg.set_property("gamma",       gamma)
+                cfg.set_property("low-output",  low_output / 255.0)
+                cfg.set_property("high-output", high_output / 255.0)
+                proc.run(cfg)
+            finally:
+                image.undo_group_end()
+            Gimp.displays_flush()
+            return {"status": "success", "results": {
+                "status": "success", "channel": channel_str,
+                "low_input": low_input, "high_input": high_input, "gamma": gamma,
+                "low_output": low_output, "high_output": high_output}}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
     def _adjust_curves(self, params):
         """Adjust tonal curves."""
         try:
@@ -3334,6 +3406,31 @@ class MCPPlugin(Gimp.PlugIn):
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
+    def _layer_from_visible(self, params):
+        """Stamp a merged copy of all visible layers as a new layer on top.
+
+        Non-destructive: the source layers are untouched (unlike flatten /
+        merge_visible). gimp_layer_new_from_visible builds the layer from the
+        composited projection; insert at position 0 (top of the stack).
+        """
+        try:
+            image_index = int(params.get("image_index", 0))
+            name        = params.get("name") or "Visible"
+            image = self._get_image(image_index)
+            image.undo_group_start()
+            try:
+                new_layer = Gimp.Layer.new_from_visible(image, image, name)
+                image.insert_layer(new_layer, None, 0)
+            finally:
+                image.undo_group_end()
+            Gimp.displays_flush()
+            return {"status": "success", "results": {
+                "layer_name": new_layer.get_name(),
+                "layer_id": new_layer.get_id(),
+            }}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
     def _list_layers(self, params):
         """List all layers with properties."""
         try:
@@ -3421,6 +3518,53 @@ class MCPPlugin(Gimp.PlugIn):
                 image.undo_group_end()
             Gimp.displays_flush()
             return {"status": "success", "results": {"status": "success"}}
+        except Exception as e:
+            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+
+    def _bucket_fill(self, params):
+        """Flood-fill contiguous similar pixels from a seed point (paint bucket).
+
+        gimp_drawable_edit_bucket_fill honours context settings (opacity, sample
+        threshold). threshold is 0-255 (default 15) matching the selection tools.
+        If a color is given it becomes the foreground and is filled with
+        FillType.FOREGROUND; otherwise the current foreground is used.
+        """
+        try:
+            from gi.repository import Gegl
+            image_index = int(params.get("image_index", 0))
+            layer_name  = params.get("layer_name", None)
+            color_str   = params.get("color", None)
+            threshold   = int(params.get("threshold", 15))
+            opacity     = params.get("opacity", None)
+            x = params.get("x", None)
+            y = params.get("y", None)
+
+            if x is None or y is None:
+                return {"status": "error", "error": "bucket_fill requires seed point x and y"}
+            x = int(x)
+            y = int(y)
+
+            image    = self._get_image(image_index)
+            drawable = self._resolve_layer(image, layer_name, None)
+            w, h = drawable.get_width(), drawable.get_height()
+            if not (0 <= x < w and 0 <= y < h):
+                return {"status": "error",
+                        "error": f"seed point ({x},{y}) is outside layer bounds {w}x{h}"}
+
+            image.undo_group_start()
+            Gimp.context_push()
+            try:
+                Gimp.context_set_sample_threshold_int(threshold)
+                if opacity is not None:
+                    Gimp.context_set_opacity(float(opacity))
+                if color_str is not None:
+                    Gimp.context_set_foreground(Gegl.Color.new(color_str))
+                Gimp.Drawable.edit_bucket_fill(drawable, Gimp.FillType.FOREGROUND, x, y)
+            finally:
+                Gimp.context_pop()
+                image.undo_group_end()
+            Gimp.displays_flush()
+            return {"status": "success", "results": {"status": "success", "x": x, "y": y}}
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
