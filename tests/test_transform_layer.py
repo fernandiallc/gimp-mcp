@@ -134,7 +134,10 @@ def _stub_image_layer(plugin, monkeypatch, layer):
     return image
 
 
-def _make_layer(name="L1", offsets=(0, 0), width=50, height=100):
+def _make_layer(name="L1", offsets=(True, 0, 0), width=50, height=100):
+    # GIMP 3.x get_offsets() returns a 3-tuple (success_bool, x, y) -- the C
+    # out-param success flag leaks into the binding. Stub it faithfully so the
+    # _layer_offsets() helper (which strips the bool) is exercised correctly.
     layer = MagicMock(name="layer")
     layer.get_name.return_value = name
     layer.get_offsets.return_value = offsets
@@ -207,7 +210,7 @@ def test_transform_fails_loud_on_active_selection(plugin, plugin_mod, monkeypatc
 
 
 def test_scale_computes_bbox_from_offset(plugin, monkeypatch):
-    layer = _make_layer(offsets=(10, 20))
+    layer = _make_layer(offsets=(True, 10, 20))
     _stub_image_layer(plugin, monkeypatch, layer)
 
     plugin._transform_layer({"operation": "scale", "scale_width": 200, "scale_height": 120})
@@ -297,3 +300,22 @@ def test_context_popped_even_on_error(plugin, plugin_mod, monkeypatch):
     # finally block restores context + closes undo group even when op is invalid.
     plugin_mod.Gimp.context_pop.assert_called_once()
     image.undo_group_end.assert_called_once()
+
+
+# --- _layer_offsets helper (m7: get_offsets 3-tuple bool leak) ----------------
+
+def test_layer_offsets_strips_success_bool(plugin):
+    """GIMP 3.x get_offsets() returns (success, x, y); the helper must return just
+    (x, y) as ints. Without it, list(get_offsets()) renders [True, x, y] in
+    list_layers and a 2-value unpack crashes transform_layer's scale path."""
+    layer = MagicMock()
+    layer.get_offsets.return_value = (True, 12, 34)
+    assert plugin._layer_offsets(layer) == (12, 34)
+
+
+def test_layer_offsets_coerces_to_int(plugin):
+    layer = MagicMock()
+    layer.get_offsets.return_value = (True, 5.0, 7.0)
+    ox, oy = plugin._layer_offsets(layer)
+    assert (ox, oy) == (5, 7)
+    assert isinstance(ox, int) and isinstance(oy, int)

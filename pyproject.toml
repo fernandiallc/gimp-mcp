@@ -23,8 +23,25 @@ gimp-mcp-server = "gimp_mcp_server:main"
 [tool.setuptools]
 py-modules = ["gimp_mcp_server"]
 
+[tool.ruff.lint]
+# Add T20 (flake8-print) to ruff's defaults: gimp_mcp_server.py speaks JSON-RPC
+# over stdout, so a stray print() there corrupts the MCP protocol. T20 turns that
+# into a lint failure -- a cheap guard against the exact stdio-hygiene bug class
+# we've already hit. extend-select (not select) keeps ruff's default E+F rules.
+extend-select = ["T20"]
+
 [tool.ruff.lint.per-file-ignores]
-"gimp-mcp-plugin.py" = ["E402"]
+# T20 (no print) is enforced ONLY on gimp_mcp_server.py, whose stdout is the MCP
+# JSON-RPC channel. Everything else is a separate process or a console tool where
+# print() is correct: the plugin runs inside GIMP (stdout = GIMP's console);
+# run_tests.py and the bg_remove/agent_edit demos are CLI scripts that print
+# results; tests print freely.
+"gimp-mcp-plugin.py" = ["E402", "T20"]
+"tests/**" = ["T20"]
+"run_tests.py" = ["T20"]
+"agent_edit_demo.py" = ["T20"]
+"bg_remove.py" = ["T20"]
+"bg_remove_iterative.py" = ["T20"]
 
 [tool.pytest.ini_options]
 # Repo root holds gimp_mcp_server.py as a top-level module; put it on sys.path

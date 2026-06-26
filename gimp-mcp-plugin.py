@@ -200,11 +200,18 @@ class MCPPlugin(Gimp.PlugIn):
                     continue
                 except OSError:
                     # Only an intentional shutdown (running=False, socket closed by
-                    # shutdown_server) should end the loop. Any other OSError (e.g.
-                    # a socket closed underneath us) re-loops; the rebind/None guards
-                    # above then recover the listener.
+                    # shutdown_server) should end the loop.
                     if not self.running:
                         break
+                    # A non-timeout OSError means the listener itself is broken
+                    # (closed underneath us, bad fd). Unlike socket.timeout, accept()
+                    # returns *immediately*, so a bare `continue` here spins at 100%
+                    # CPU if the error persists. Back off briefly, then request a
+                    # rebind so the top-of-loop guard re-creates the socket and
+                    # actually recovers instead of just looping.
+                    import time
+                    time.sleep(0.5)
+                    self._rebind_requested = True
                     continue
                 client_thread = threading.Thread(target=self._handle_client, args=(client,))
                 client_thread.daemon = True
@@ -1854,6 +1861,19 @@ class MCPPlugin(Gimp.PlugIn):
             return layers[0]
         return layer
 
+    @staticmethod
+    def _layer_offsets(layer):
+        """Return (x, y) layer offsets as plain ints.
+
+        GIMP 3.x's introspected get_offsets() returns a 3-tuple
+        (success_bool, offset_x, offset_y) -- the C out-param success flag
+        leaks into the binding. Callers want just the coordinates, so strip the
+        leading bool. Without this, list(get_offsets()) renders [True, x, y] and
+        a 2-value unpack (ox, oy = get_offsets()) crashes with ValueError.
+        """
+        _ok, ox, oy = layer.get_offsets()
+        return int(ox), int(oy)
+
     def _channel_ops_from_string(self, op):
         """Map operation string to Gimp.ChannelOps enum value."""
         return {
@@ -2774,7 +2794,7 @@ class MCPPlugin(Gimp.PlugIn):
                     sw, sh = int(sw), int(sh)
                     if sw <= 0 or sh <= 0:
                         raise ValueError("scale_width and scale_height must be positive")
-                    ox, oy = layer.get_offsets()  # _list_layers proves this is a 2-tuple
+                    ox, oy = self._layer_offsets(layer)
                     layer = layer.transform_scale(ox, oy, ox + sw, oy + sh)
 
                 elif operation == "flip":
@@ -2800,7 +2820,7 @@ class MCPPlugin(Gimp.PlugIn):
                 image.undo_group_end()
 
             Gimp.displays_flush()
-            offsets = list(layer.get_offsets())
+            offsets = list(self._layer_offsets(layer))
             return {"status": "success", "results": {
                 "status":    "success",
                 "operation": operation,
@@ -3477,7 +3497,7 @@ class MCPPlugin(Gimp.PlugIn):
                         "width":      layer.get_width(),
                         "height":     layer.get_height(),
                         "has_alpha":  layer.has_alpha(),
-                        "offsets":    list(layer.get_offsets()),
+                        "offsets":    list(self._layer_offsets(layer)),
                     })
                 except Exception as ex:
                     layer_list.append({"index": i, "error": str(ex)})
@@ -4327,6 +4347,11 @@ class MCPPlugin(Gimp.PlugIn):
             image_index = int(params.get("image_index", 0))
             layer_name  = params.get("layer_name", None)
             merge       = bool(params.get("merge", False))
+            opacity     = float(params.get("opacity", 100))
+            blend_mode  = params.get("blend_mode", None)
+
+            if not 0 <= opacity <= 100:
+                raise RuntimeError(f"opacity must be 0-100, got {opacity}")
 
             image    = self._get_image(image_index)
             drawable = self._resolve_layer(image, layer_name, None)
@@ -4347,6 +4372,14 @@ class MCPPlugin(Gimp.PlugIn):
                         f"{prop_err}. Valid properties: {valid}"
                     )
 
+            # Filter compositing: opacity is 0.0-1.0 on a DrawableFilter (NOT the
+            # 0-100 layers use), so convert. blend_mode reuses the layer-mode
+            # vocabulary via _blend_mode_from_string. Both must be set before
+            # update() commits the filter config.
+            f.set_opacity(opacity / 100.0)
+            if blend_mode is not None:
+                f.set_blend_mode(self._blend_mode_from_string(blend_mode))
+
             f.update()
 
             image.undo_group_start()
@@ -4360,11 +4393,13 @@ class MCPPlugin(Gimp.PlugIn):
 
             Gimp.displays_flush()
             return {"status": "success", "results": {
-                "status":    "success",
-                "operation": operation,
-                "layer":     drawable.get_name(),
-                "merged":    merge,
-                "mode":      "merged" if merge else "appended",
+                "status":     "success",
+                "operation":  operation,
+                "layer":      drawable.get_name(),
+                "merged":     merge,
+                "mode":       "merged" if merge else "appended",
+                "opacity":    opacity,
+                "blend_mode": blend_mode or "NORMAL",
             }}
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
@@ -4703,39 +4738,31 @@ class MCPPlugin(Gimp.PlugIn):
         except Exception as e:
             return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
 
+    # GIMP 3.2's plug-in API deliberately exposes undo *grouping* (group_start/
+    # end, freeze/thaw, disable/enable) but no call to *perform* an undo/redo
+    # step -- neither Gimp.Image nor the PDB has one (verified live on 3.2.4).
+    # Undo is a GUI-only operation. The old handlers called a non-existent
+    # image.undo()/redo(), so they always crashed with AttributeError. Fail loud
+    # with an accurate, actionable message instead of pretending or crashing.
+    _UNDO_UNSUPPORTED = (
+        "Programmatic {op} is not supported by the GIMP 3.2 plug-in API: GIMP "
+        "exposes undo grouping (undo_group_start/end) but no call to perform an "
+        "{op} step -- it is a GUI-only action. To make edits reversible: (1) the "
+        "user can {op} manually in GIMP ({key}); operations are already wrapped "
+        "in undo groups so one {key} reverses a whole step. Or (2) call save_xcf "
+        "or duplicate_layer before risky edits to keep a restore point you can "
+        "reload."
+    )
+
     def _undo(self, params):
-        """Undo N steps."""
-        try:
-            image_index = int(params.get("image_index", 0))
-            steps       = int(params.get("steps", 1))
-            image = self._get_image(image_index)
-            done = 0
-            for _ in range(steps):
-                if image.undo():
-                    done += 1
-                else:
-                    break
-            Gimp.displays_flush()
-            return {"status": "success", "results": {"steps_undone": done}}
-        except Exception as e:
-            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+        """Not supported in GIMP 3.2 -- see _UNDO_UNSUPPORTED."""
+        return {"status": "error",
+                "error": self._UNDO_UNSUPPORTED.format(op="undo", key="Ctrl+Z")}
 
     def _redo(self, params):
-        """Redo N steps."""
-        try:
-            image_index = int(params.get("image_index", 0))
-            steps       = int(params.get("steps", 1))
-            image = self._get_image(image_index)
-            done = 0
-            for _ in range(steps):
-                if image.redo():
-                    done += 1
-                else:
-                    break
-            Gimp.displays_flush()
-            return {"status": "success", "results": {"steps_redone": done}}
-        except Exception as e:
-            return {"status": "error", "error": str(e), "traceback": traceback.format_exc()}
+        """Not supported in GIMP 3.2 -- see _UNDO_UNSUPPORTED."""
+        return {"status": "error",
+                "error": self._UNDO_UNSUPPORTED.format(op="redo", key="Ctrl+Y")}
 
     def _convert_color_mode(self, params):
         """Convert image color mode."""

@@ -75,6 +75,8 @@ def test_apply_filter_sends_correct_command(fake_conn_factory):
         "image_index": 0,
         "layer_name": None,
         "merge": False,
+        "opacity": 100,
+        "blend_mode": None,
     }
     assert out == {"operation": "gegl:gaussian-blur"}
 
@@ -83,6 +85,22 @@ def test_apply_filter_merge_true_propagates(fake_conn_factory):
     fake = fake_conn_factory({"status": "success", "results": {"mode": "merged"}})
     s.apply_filter(ctx=None, operation="gegl:pixelize", merge=True)
     assert fake.sent[0][1]["merge"] is True
+
+
+def test_apply_filter_opacity_and_blend_propagate(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success", "results": {}})
+    s.apply_filter(ctx=None, operation="gegl:bloom", opacity=40, blend_mode="screen")
+    sent = fake.sent[0][1]
+    assert sent["opacity"] == 40
+    assert sent["blend_mode"] == "screen"
+
+
+def test_apply_filter_opacity_blend_default(fake_conn_factory):
+    fake = fake_conn_factory({"status": "success", "results": {}})
+    s.apply_filter(ctx=None, operation="gegl:vibrance")
+    sent = fake.sent[0][1]
+    assert sent["opacity"] == 100
+    assert sent["blend_mode"] is None
 
 
 def test_apply_filter_params_default_none(fake_conn_factory):

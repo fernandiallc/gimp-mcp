@@ -6,11 +6,26 @@ test/CI safety net. All notable changes from the upstream baseline are listed
 below, newest first. Dates are when the work landed on `main`.
 
 The format is loosely based on [Keep a Changelog](https://keepachangelog.com).
-This project is not yet formally versioned; entries are grouped by theme.
+`0.1.0` is the first tagged release of the fork; entries are grouped by theme.
 
-## [Unreleased] — fork changes over upstream
+## [0.1.0] — 2026-06-26
 
 ### Reliability & correctness (the headline work)
+
+- **`undo` / `redo` no longer crash — honest fail instead.** GIMP 3.2's plug-in
+  API exposes undo *grouping* but no call to *perform* an undo/redo step (verified
+  live against 3.2.4: neither `Gimp.Image` nor the PDB has one — it is a GUI-only
+  action). The tools called a non-existent `image.undo()` and always died with
+  `AttributeError`. They now return a clear, actionable error: undo manually in
+  GIMP (Ctrl+Z; ops are wrapped in undo groups) or use `save_xcf` /
+  `duplicate_layer` restore points before risky edits.
+- **Layer offset bool leak (`get_offsets`).** GIMP 3.x's `get_offsets()` returns
+  a 3-tuple `(success, x, y)`; the success flag leaked through, so `list_layers`
+  reported `offsets: [true, 0, 0]` and `transform_layer`'s scale path crashed on a
+  2-value unpack. A shared `_layer_offsets()` helper strips the bool at all sites.
+- **`restart`/accept-loop busy-spin.** A non-timeout `OSError` in the socket
+  accept loop re-looped with no backoff, pegging a CPU core if the error
+  persisted. It now backs off briefly and requests a listener rebind to self-heal.
 
 - **Thread-safety crash fix (root cause).** libgimp/PDB is not thread-safe, but
   client requests were handled on worker threads, so heavy ops (scale/flatten/
@@ -61,6 +76,9 @@ This project is not yet formally versioned; entries are grouped by theme.
 
 - **Non-destructive GEGL:** `apply_filter` (generic, parametric, stacking
   `Gimp.DrawableFilter` over the GEGL catalog; fails loud on an unknown property).
+  Now also takes `opacity` (0–100; converted to the filter's 0–1 scale) and
+  `blend_mode` (layer-mode vocabulary), so a non-destructive effect can be applied
+  partially or composited (e.g. a 40-opacity blur, or a bloom in "screen").
 - **Layers/masks:** `add_layer_mask`, `apply_layer_mask`, `merge_down`,
   `layer_from_visible` (non-destructive merged stamp).
 - **Transforms:** `transform_layer` (per-layer rotate/scale/flip/offset; fails
@@ -83,8 +101,12 @@ This project is not yet formally versioned; entries are grouped by theme.
   JSON-RPC channel for the stdio transport).
 - **Tests & CI:** a no-GIMP test layer (mock-socket unit tests, a static
   dispatch-contract test that fails the build on server/plugin drift, and
-  framing round-trip tests) — **162 tests**, run in CI alongside `ruff`. The
+  framing round-trip tests) — **172 tests**, run in CI alongside `ruff`. The
   live-GIMP `run_tests.py` remains as a manual integration suite.
+- **`print()` guard (ruff T20):** enforced on `gimp_mcp_server.py`, whose stdout
+  is the JSON-RPC channel — a stray `print()` there corrupts the protocol, so it
+  now fails lint. The plugin (separate process) and console scripts are exempt.
+- **Removed the redundant `lint.yml`** workflow (its ruff job duplicated CI).
 - **Dependency hygiene:** pinned `mcp>=1.12,<2`, dropped the standalone
   `fastmcp` dependency, committed `uv.lock`.
 

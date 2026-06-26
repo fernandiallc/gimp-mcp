@@ -2992,6 +2992,8 @@ def apply_filter(
     image_index: int = 0,
     layer_name: str | None = None,
     merge: bool = False,
+    opacity: float = 100,
+    blend_mode: str | None = None,
 ) -> dict:
     """Apply a GEGL operation to a layer as a non-destructive, re-editable filter.
 
@@ -3009,14 +3011,21 @@ def apply_filter(
     - image_index: Target image index (default 0).
     - layer_name: Target layer; defaults to the active layer.
     - merge: False (default) = non-destructive / re-editable; True = bake destructively.
+    - opacity: Filter opacity 0-100 (default 100). Lets the effect blend partially
+      with the unfiltered layer, e.g. a 40-opacity blur for a subtle softening.
+    - blend_mode: Filter blend mode by name (same vocabulary as layer modes, e.g.
+      "multiply", "screen", "overlay"). Default None = NORMAL. Lets a filter
+      composite over the layer, e.g. a grain/bloom in "screen".
 
-    Returns a status dict with the operation, target layer, and merged/appended state.
+    Returns a status dict with the operation, target layer, merged/appended state,
+    and the applied opacity / blend_mode.
     """
     try:
         conn = get_gimp_connection()
         result = conn.send_command("apply_filter", {
             "operation": operation, "params": params,
             "image_index": image_index, "layer_name": layer_name, "merge": merge,
+            "opacity": opacity, "blend_mode": blend_mode,
         })
         if result["status"] == "success":
             return result["results"]
@@ -3298,13 +3307,20 @@ def set_active_image(ctx: Context, image_index: int) -> dict:
 
 @mcp.tool()
 def undo(ctx: Context, steps: int = 1, image_index: int = 0) -> dict:
-    """Undo one or more operations on an image.
+    """NOT SUPPORTED in GIMP 3.2 -- always raises, by design.
+
+    GIMP's plug-in API exposes undo *grouping* but no call to *perform* an undo
+    step (undo is a GUI-only action; neither Gimp.Image nor the PDB has one).
+    This tool therefore always raises with guidance. For reversible edits: the
+    user can undo manually in GIMP (Ctrl+Z) -- ops are wrapped in undo groups so
+    one Ctrl+Z reverses a whole step -- or call save_xcf / duplicate_layer before
+    risky edits to keep a restore point. Do not rely on this tool to roll back.
 
     Parameters:
-    - steps: Number of undo steps (default 1)
-    - image_index: Target image index (default 0)
+    - steps: ignored
+    - image_index: ignored
 
-    Returns: {steps_undone}
+    Raises: always (with the explanation above).
     """
     try:
         conn = get_gimp_connection()
@@ -3319,13 +3335,17 @@ def undo(ctx: Context, steps: int = 1, image_index: int = 0) -> dict:
 
 @mcp.tool()
 def redo(ctx: Context, steps: int = 1, image_index: int = 0) -> dict:
-    """Redo one or more previously undone operations on an image.
+    """NOT SUPPORTED in GIMP 3.2 -- always raises, by design.
+
+    Same limitation as undo(): GIMP's plug-in API has no call to perform a redo
+    step (it is a GUI-only action). For reversible edits, the user can redo
+    manually in GIMP (Ctrl+Y), or use save_xcf / duplicate_layer restore points.
 
     Parameters:
-    - steps: Number of redo steps (default 1)
-    - image_index: Target image index (default 0)
+    - steps: ignored
+    - image_index: ignored
 
-    Returns: {steps_redone}
+    Raises: always (with the explanation above).
     """
     try:
         conn = get_gimp_connection()
