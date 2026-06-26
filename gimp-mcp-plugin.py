@@ -292,40 +292,27 @@ class MCPPlugin(Gimp.PlugIn):
     def _handle_client(self, client):
         """Handle connected client"""
         # print("Client handler started")
-        buffer = b''
+        buffer = bytearray()   # O(n) accumulation (bytes += would be O(n^2) memcpy)
 
-        # Receive data in chunks to handle larger payloads
+        # NDJSON framing: read until the '\n' terminator OR EOF (peer close).
+        # O(1) terminator check per chunk — never json.loads the growing buffer
+        # (was O(n^2) on multi-MB payloads). Back-compat: an OLD server that sends
+        # no trailing '\n' still completes on EOF. The raw request string is handed
+        # to execute_command (which does its own json.loads), so the bare
+        # "disable_auto_disconnect" command — not valid JSON — keeps working.
         while True:
-            data = client.recv(4096)
-            # print(f"Received data: {data}")
+            data = client.recv(65536)
             if not data:
                 break
-            buffer += data
-            
-            # Check if we have a complete message
-            # For simplicity, assume messages end with newline or are complete JSON
-            try:
-                if isinstance(buffer, (bytes, bytearray)):
-                    request = buffer.decode('utf-8')
-                else:
-                    request = str(buffer)
-                
-                # Try to parse as JSON to see if complete
-                if request.strip():
-                    json.loads(request)  # This will raise if incomplete
-                    break
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                # Continue receiving if JSON is incomplete
-                continue
-        
+            buffer.extend(data)
+            if buffer.endswith(b'\n'):
+                break
+
         if not buffer:
             print("Client disconnected")
             return
 
-        if isinstance(buffer, (bytes, bytearray)):
-            request = buffer.decode('utf-8')
-        else:
-            request = str(buffer)
+        request = buffer.rstrip(b'\n').decode('utf-8')
         
         # print(f"Parsed request: {request}")
         # GIMP/PDB calls are not thread-safe — run the command on the main thread
@@ -337,9 +324,12 @@ class MCPPlugin(Gimp.PlugIn):
             response_str = json.dumps(response)
         else:
             response_str = str(response)
-            
+
+        # NDJSON: terminate the response with exactly one '\n'. json.dumps never
+        # emits a literal newline (it escapes '\n' inside strings), so this is the
+        # sole frame delimiter. The server reads until '\n' OR EOF.
         # Send response in chunks for large data
-        response_bytes = response_str.encode('utf-8')
+        response_bytes = response_str.encode('utf-8') + b'\n'
         bytes_sent = 0
         while bytes_sent < len(response_bytes):
             chunk = response_bytes[bytes_sent:bytes_sent + 8192]
